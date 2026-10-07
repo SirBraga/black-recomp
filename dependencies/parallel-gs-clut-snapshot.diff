@@ -1,0 +1,26 @@
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index d9acc50..dbb3789 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -260,6 +260,8 @@ public:
+ 	// Caching stage.
+ 	uint32_t update_palette_cache(const PaletteUploadDescriptor &desc);
+ 	void mark_clut_read(uint32_t clut_instance);
++	// Read-only diagnostic access; callers must flush and synchronize copies.
++	const Vulkan::BufferHandle &debug_clut_buffer() const { return buffers.clut; }
+ 	void rewind_clut_instance(uint32_t index);
+ 
+ 	Vulkan::ImageHandle create_cached_texture(const TextureDescriptor &desc);
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 9f05da8..7e4863f 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -288,6 +291,8 @@ public:
+ 
+ 	RegisterState &get_register_state();
+ 	const RegisterState &get_register_state() const;
++	const Vulkan::BufferHandle &debug_clut_buffer() const { return renderer.debug_clut_buffer(); }
++	uint32_t debug_clut_instance() const { return render_pass.clut_instance; }
+ 
+ 	PrivRegisterState &get_priv_register_state();
+ 	const PrivRegisterState &get_priv_register_state() const;

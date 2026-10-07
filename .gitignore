@@ -1,0 +1,52 @@
+# Sistema / editores
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# Saídas de build
+build/
+out/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+
+# Arquivos do jogo ou derivados dele: NUNCA versionar
+*.iso
+*.ISO
+*.bin
+*.BIN
+*.elf
+*.ELF
+*.xbe
+*.XBE
+*.irx
+*.IRX
+*.m2v
+*.M2V
+SLUS_*
+SCUS_*
+PS2_BIOS/
+bios/
+*.rom
+*.vram.bin
+*.clut.bin
+*.rdram.bin
+# capturas/dumps de diagnóstico e imagens extraídas do jogo
+*.png
+*.ppm
+*.raw
+*.dump
+# código gerado pelo recompilador a partir do ELF / bundles VU capturados
+sub_*.cpp
+entry_*.cpp
+register_functions.cpp
+ps2_recompiled_*.h
+black_vu_aot_generated.hpp
+*.toml

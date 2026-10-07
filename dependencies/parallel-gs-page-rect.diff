@@ -1,0 +1,15 @@
+diff --git a/gs/gs_util.cpp b/gs/gs_util.cpp
+index 4feb3bd..3bc7999 100644
+--- a/gs/gs_util.cpp
++++ b/gs/gs_util.cpp
+@@ -175,8 +175,8 @@ PageRect compute_page_rect(uint32_t base_256, uint32_t x, uint32_t y,
+ 	uint32_t block_offset = base_256 % BlocksPerPage;
+ 
+ 	// Get maximum block index observed in the spill block region.
+-	uint32_t max_block_x = ((width - 1) >> layout.block_width_log2) % BlocksPerPage;
+-	uint32_t max_block_y = ((height - 1) >> layout.block_height_log2) % BlocksPerPage;
++	uint32_t max_block_x = std::min((width - 1) >> layout.block_width_log2, BlocksPerPage - 1);
++	uint32_t max_block_y = std::min((height - 1) >> layout.block_height_log2, BlocksPerPage - 1);
+ 
+ 	// Have to analyze if we need to consider straddle behavior within a page.
+ 	// Also, do fine-grained tracking for single page rects.

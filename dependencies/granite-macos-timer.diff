@@ -1,0 +1,18 @@
+diff --git a/util/timer.cpp b/util/timer.cpp
+index a140835..d8f1162 100644
+--- a/util/timer.cpp
++++ b/util/timer.cpp
+@@ -138,6 +138,13 @@ void sleep_until_nsecs(int64_t timepoint)
+ 		_mm_pause();
+ #endif
+ 	}
++#elif defined(__APPLE__)
++    for (;;) {
++        int64_t remaining = timepoint - get_current_time_nsecs();
++        if (remaining <= 0) return;
++        struct timespec duration = { remaining / 1000000000ll, remaining % 1000000000ll };
++        if (nanosleep(&duration, nullptr) != 0 && errno != EINTR) return;
++    }
+ #else
+ 	constexpr auto timebase = CLOCK_MONOTONIC;
+ 	struct timespec ts = {};

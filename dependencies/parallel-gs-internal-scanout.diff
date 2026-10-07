@@ -1,0 +1,40 @@
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 9f05da8..fd0c744 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -183,6 +183,9 @@ struct VSyncInfo
+ 	// This can help games which don't scan out the full 224 lines for example.
+ 	// This will look funny if the game is constantly changing vertical scanout resolution.
+ 	bool raw_circuit_scanout;
++	// Host presentation at literal circuit resolution, without analog CRT
++	// timing extents/beam offsets. DISPFB origins and PMODE composition remain.
++	bool internal_resolution_scanout = false;
+ 
+ 	// When using SSAA, attempt to scan out a higher resolution image based on the super samples.
+ 	// This only works well if the game is rendering 3D geometry directly to the frame buffer which is used to scanout.
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index dbe032d..3d5b4d2 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4797,6 +4797,21 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		}
+ 	}
+ 
++	if (info.internal_resolution_scanout)
++	{
++		mode_width = std::max(circuit1 ? circuit1->get_width() : 0u,
++		                      circuit2 ? circuit2->get_width() : 0u);
++		mode_height = std::max(circuit1 ? circuit1->get_height() : 0u,
++		                       circuit2 ? circuit2->get_height() : 0u);
++		for (uint32_t i = 0; i < 2; ++i)
++		{
++			const auto &circuit = i ? circuit2 : circuit1;
++			crtc_rects[i].offset = {0, 0};
++			crtc_rects[i].extent = {circuit ? circuit->get_width() : 0u,
++			                        circuit ? circuit->get_height() : 0u};
++		}
++	}
++
+ 	ScanoutResult result = {};
+ 	result.mode_width = mode_width;
+ 	result.mode_height = mode_height;

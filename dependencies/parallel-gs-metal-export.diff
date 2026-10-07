@@ -1,0 +1,25 @@
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4281,5 +4281,10 @@
+ 	image_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+ 	image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+ 	image_info.misc |= Vulkan::IMAGE_MISC_MUTABLE_SRGB_BIT;
++#ifdef VK_USE_PLATFORM_METAL_EXT
++	VkExportMetalObjectCreateInfoEXT metal_texture_export{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
++	metal_texture_export.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
++	image_info.pnext = &metal_texture_export;
++#endif
+ 
+ 	Vulkan::ImageHandle circuit1, circuit2;
+@@ -5171,5 +5176,10 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd, const VSyncInfo &vsync)
+ 	image_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+ 	image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+ 	image_info.misc |= Vulkan::IMAGE_MISC_MUTABLE_SRGB_BIT;
++#ifdef VK_USE_PLATFORM_METAL_EXT
++	VkExportMetalObjectCreateInfoEXT metal_texture_export{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
++	metal_texture_export.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
++	image_info.pnext = &metal_texture_export;
++#endif
+ 
+ 	auto deinterlaced = device->create_image(image_info);
