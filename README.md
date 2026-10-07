@@ -13,6 +13,7 @@ Só funciona no macOS com Apple Silicon (testei num M1 Pro).
 ## Até onde chegou
 
 - O jogo abre, passa pelo menu, toca os vídeos e chega na primeira fase (Level_00).
+- **As texturas da sala agora aparecem certas.** O problema era a ordem dos uploads: o jogo libera as texturas aos poucos, mas o runtime soltava tudo de uma vez e as paletas eram sobrescritas antes de serem usadas. Agora sai um pacote por vez e as paletas chegam certas na hora do desenho.
 - No menu e nos vídeos fica entre uns 24 e 30 updates/s.
 - Dá pra pular vídeo com Tab ou Select.
 - Teclado e controle funcionam (veja [CONTROLES.md](CONTROLES.md)).
@@ -20,10 +21,11 @@ Só funciona no macOS com Apple Silicon (testei num M1 Pro).
 
 ## O que falta
 
-Por enquanto não dá pra jogar de verdade.
+Por enquanto ainda não dá pra jogar de verdade.
 
-- **Desempenho:** no Level_00 o jogo cai pra uns 2 updates/s. A GPU engasga com a quantidade de uploads de textura, e a fila chega a travar uns 18 segundos. O próximo passo é juntar vários uploads num envio só.
-- **Gráficos quebrados:** as texturas e cores da fase ainda aparecem bem erradas.
+- **Desempenho:** no Level_00 o jogo fica em uns 2 a 3 updates/s. A correção das texturas não mudou isso. A GPU engasga com o volume de uploads e a fila às vezes trava vários segundos. O próximo passo é diminuir esse volume.
+- **Câmera no começo da fase:** a arma aparecia deslocada pro lado. Ainda não foi confirmado se isso está resolvido.
+- A correção das texturas só foi testada no Level_00.
 - **Mostrar a imagem direto da GPU,** sem copiar cada quadro de volta pra CPU.
 - **VU1 ainda é lenta,** porque roda no interpretador.
 - Falta confirmar que dá pra controlar o personagem de boa na fase.

@@ -694,3 +694,19 @@ O alvo diagnóstico opcional `ps2x_sdl_gpu_gs_probe` liga SDL_GPU ao `GSCpuBacke
 ### Prova SDL_GPU de textura indexada capturada — 2026-10-06
 
 `ps2x_sdl_gpu_psmt4_probe` executa no driver Metal e lê `level00-correlated-snapshot-v4.vram.bin` com TEX0 `0x2005afe55d40ad60`, usando a CLUT capturada em `level00-correlated-snapshot-v4.clut.bin`. Resultado: PASS para os 4.096 pixels de PSMT4 128×32; GPU compute e `GSMem::ReadTexture` + CLUT do cache produzem o mesmo CT32, e a CLUT capturada tem zero entradas divergentes da VRAM. Isso fecha a validação de leitura indexada para esse snapshot, sem provar renderização de primitivas nem explicar a corrupção temporal de outros draws. A imagem de saída fica em `recomp/diagnostics/sdl-gpu-captured-psmt4.ppm` (arquivo diagnóstico ignorado). Ainda é um probe isolado: a gameplay usa o backend existente.
+
+### Corrupção de texturas do Level_00 resolvida: gating do PATH3 por MSKPATH3 — 2026-10-07
+
+Causa: o Black controla o PATH3 por `MSKPATH3` no stream VIF1. A cadeia GIF de 4,79 MB (14 EOPs, ~1.580 uploads) chegava com PATH3 mascarado, entrava inteira na fila mascarada e o primeiro `MSKPATH3(0)` despejava tudo; os uploads seguintes reusavam o pool e sobrescreviam CLUTs antes dos draws PATH1. Correção em `ps2_memory.cpp`/`ps2_vif1_interpreter.cpp`: com PATH3 mascarado a cadeia é dividida por EOP ao entrar na fila e cada transição 1→0 de `MSKPATH3` libera um único pacote. Reset VIF1 e novo PATH3 sem máscara continuam despejando tudo. **Ligado por padrão**; `PS2X_PATH3_EOP_GATE=0` restaura o comportamento antigo.
+
+Validação (`bash ps2recomp/diagnostics/TestarPath3Gate.command [default|gate|baseline]`, SDL_GPU, mesmo roteiro de pad; resultados em `recomp/diagnostics/path3-gate/`, runs anteriores em `run1`…`run4`):
+
+- Verificador de CLUT (`clut_last_writer.py`): gate/default 65.388–65.943 TEX0 indexados, 100% lidos de upload de paleta e 0 sobrescritos, em 5 runs; baseline 12.636–17.196 de paleta e 48.853–52.125 sobrescritos, em 3 runs. Máximo de uploads sem TEX0: 197–202 contra 1.578–1.585 (PCSX2: 151).
+- `[path3-gate]`: todas as cadeias chegam mascaradas no kick (0 não mascaradas); com o gate `flush-all=0`; a fila oscila entre 2 e 8 e `max-fifo=14` durante 150 s de fase, sem crescer.
+- Visual: o usuário confirmou no jogo as texturas da sala corretas; o baseline mostra paredes em faixas magenta/verde (`run2/baseline-frame2.png`).
+- Sem guest-fault, missing-target ou exhaustion.
+- Updates/s na fase iguais nos dois modos: 0,77–0,82 com gate e 0,79 sem (medido com `BLACK_DUMP_EVERY=5` e captura GIF ligada). O gate não custa nem resolve desempenho; ~0,8 upd/s é o próximo problema.
+
+Patch `0001-black-runtime-fixes.patch` regenerado com o comando do SKILL §0 (67 arquivos; inclui também o backend SDL_GPU que estava fora do 0001 desde 2026-10-05). `PS2Recomp-local-changes.patch`, citado no README, **não** foi regenerado e não contém o gate.
+
+Limites: o roteiro de pad chega ao Level_00 em updates diferentes entre runs (826–1861) e às vezes a janela termina ainda no texto "4 DAYS EARLIER"; o tempo de guest avança ~1 s a cada 30 updates. O `PS2X_GIF_INCREMENTAL` segue ligado por padrão e não atua aqui porque as cadeias chegam mascaradas.

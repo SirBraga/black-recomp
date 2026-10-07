@@ -77,3 +77,5 @@ posterior, e comandos SIF não são agrupados nem descartados.
 
 - O teste de texturas inclui preservação do CLUT interno depois de sobrescrever a VRAM da paleta (PSMT4 ePSMT8, CLD=0).
 - `gpu_texture_snapshot_test.py` também valida256cores do CLUT interno (planos RG/BA) e o contexto do trigger. O decoder aceita um quinto argumento opcional com o `.clut.bin`.
+
+- `vif_progressive_test.py`: compara o parser VIF1 real em execução integral e por prefixos de comandos, com ASan/UBSan. Cobre lookahead/alinhamento V3, ciclos fill, ROW/COL, máscaras, MPG, DIRECTHL e callbacks MSCAL/MSCNT. O alvo Ninja `ps2x_dma_cooperative_smoke` verifica STR/IRQ e reentrância no PS2Memory real. O modo `PS2X_DMA_COOPERATIVE=1` é experimental e não está ativado no launcher; os resultados visuais e limites temporais estão em `diagnostics/CLUT_OVERLAP_LEVEL00.md`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit uploads and TEX0 ordering for the observed Level_00 texture bank."""
+"""audit_texture_uploads.py + --extract also writes <extract>.seq: one line per completed upload (U ev path bp psm w h bw x y) and per TEX0 (T ev path tbp cbp psm cld)."""
 import struct,sys,argparse
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument("capture")
@@ -11,6 +11,7 @@ parser.add_argument("--tex0",type=lambda value:int(value,0),help="Stop extractio
 parser.add_argument("--trace-after",type=int,help="Log registers and completed transfers after this transfer ordinal")
 parser.add_argument("--trace-bp",type=int,help="Log complete transfers to this destination base pointer with event offsets")
 args=parser.parse_args()
+LOG=open(args.extract+".seq","w") if args.extract else None
 out=open(args.extract,"wb") if args.extract else None
 state={};paths={};active=None;number=0;texnumber=0;transfer_number=0;event_number=0;event_path=0;event_pos=0
 
@@ -25,6 +26,7 @@ def reg(addr,value):
  if out and not args.all_transfers and addr in (6,7) and (value==args.tex0 if args.tex0 is not None else value>>37&16383==args.cbp and value&16383==args.tbp):
   print(f"STOP exact_tex0={value:016x} event={event_number} path={event_path} transfers={transfer_number}")
   out.close();raise SystemExit
+ (LOG.write(f'T {event_number} {event_path} {value&16383} {value>>37&16383} {(value>>20)&63} {value>>61&7}\n') if LOG and addr in (6,7) else None)
  state[addr]=value
  if addr==0x53:
   bb=state.get(0x50,0);wh=state.get(0x52,0);psm=bb>>56&63
@@ -39,6 +41,7 @@ def image(data):
   active['data']+=data
   if len(active['data'])>=active['bytes'] and active['bytes']:
    transfer_number+=1
+   LOG and LOG.write(f"U {event_number} {event_path} {active['bp']} {active['psm']} {active['w']} {active['h']} {active['bw']} {active['x']} {active['y']}\n")
    if args.trace_after is not None and transfer_number>=args.trace_after:
     print(f"transfer={transfer_number} event={event_number} path={event_path} pos={event_pos} psm={active['psm']} bp={active['bp']} bw={active['bw']} size={active['w']}x{active['h']}")
    if args.trace_bp is not None and active['bp']==args.trace_bp:

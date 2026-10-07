@@ -24,6 +24,9 @@ services_with_gif_queued = 0
 services_with_vif1_queued = 0
 last_sequence = -1
 malformed = 0
+vif1_next_offset = None
+vif1_prefix_errors = 0
+vif1_prefix_bytes = 0
 
 with open(sys.argv[1], encoding="utf-8", errors="replace") as source:
     for line in source:
@@ -36,6 +39,13 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as source:
         a, b, c = (int(match[i], 16) for i in (3, 4, 5))
         last_sequence = max(last_sequence, sequence)
         counts[event] += 1
+        if event == "DMA_CHAIN_READY" and a == 0x10009000:
+            vif1_next_offset = 0
+        elif event == "VIF1_PREFIX":
+            if b == 0 or b > c or (vif1_next_offset is not None and a != vif1_next_offset):
+                vif1_prefix_errors += 1
+            vif1_next_offset = a + b
+            vif1_prefix_bytes += b
         if event == "DMA_START":
             dma_starts[a] += 1
             if b & 0x100:
@@ -63,3 +73,4 @@ print("DMA_START per channel: " + ", ".join(f"0x{channel:08x}={count}" for chann
 print(f"SERVICE_BEGIN with queues GIF/VIF1/both={services_with_gif_queued}/{services_with_vif1_queued}/{services_with_both_queued}")
 print(f"DMA active overlap starts={overlapping_dma_starts}; max active channels={max_active_channels}; active at capture end={[f'0x{channel:08x}' for channel in sorted(active_channels)]}")
 print(f"PATH3_EOP with GIF_STR={eops_with_gif_str}/{eops}; VIF1_STR={eops_with_vif1_str}/{eops}")
+print(f"VIF1_PREFIX bytes={vif1_prefix_bytes}; boundary/continuity errors={vif1_prefix_errors}")

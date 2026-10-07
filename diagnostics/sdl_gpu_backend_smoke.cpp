@@ -60,6 +60,16 @@ int main()
         bool gpuLineMatchesCpu = false;
         bool gpuAliasedDepthMatchesCpu = false;
         bool gpuDisjointDrawsMatchCpu = false;
+        bool gpuTexturedDisjointDrawsMatchCpu = false;
+        bool gpuRasterBatchCapacityMatchesCpu = false;
+        bool gpuRasterOrderedBatchMatchesCpu = false;
+        uint64_t texturedBatchedDrawCount = 0;
+        uint64_t texturedRasterPassCount = 0;
+        bool texturedFullVramMatchesCpu = false;
+        bool gpuMipLevelMatchesCpu = false;
+        bool gpuMiptbpMxlZeroBatchMatchesCpu = false;
+        bool gpuMipAliasMatchesCpu = false;
+        bool gpuDisjointImageChunksBatchMatchCpu = false;
         bool gpuNonfiniteMatchesExplicit = false;
         bool gpuOnlyGuardPassed = false;
         std::array<uint8_t, 16> localReadbackBytes{};
@@ -470,6 +480,341 @@ int main()
         if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
         gpuDisjointDrawsMatchCpu = disjointGpuVram == disjointCpuVram;
 
+        // Textured draws can share an encoder only while the sampled GS page
+        // is disjoint from every color/depth write. Verify full VRAM and that
+        // the GPU accepted the second draw into the same pass.
+        std::vector<uint8_t> texturedGpuVram(bytes, 0);
+        std::vector<uint8_t> texturedCpuVram(bytes, 0);
+        for (uint32_t y = 0; y < 16u; ++y)
+            for (uint32_t x = 0; x < 16u; ++x)
+                GSMem::WriteCT32(texturedGpuVram.data(), 300u, 1u, x, y,
+                    0xff000000u | (x * 13u << 16u) | (y * 11u << 8u) | (x + y));
+        texturedCpuVram = texturedGpuVram;
+        const std::vector<uint8_t> texturedSeedVram = texturedGpuVram;
+        std::array<uint16_t, 512> texturedClut{};
+        GSPrimitiveBatch texturedA = disjointDrawA;
+        texturedA.state.context.frame.fbp = 100u;
+        texturedA.state.prim.tme = true;
+        texturedA.state.prim.fst = true;
+        texturedA.state.context.tex0.tbp0 = 300u;
+        texturedA.state.context.tex0.tbw = 1u;
+        texturedA.state.context.tex0.psm = GS_PSM_CT32;
+        texturedA.state.context.tex0.tcc = 1u;
+        texturedA.state.textureWidth = 16u;
+        texturedA.state.textureHeight = 16u;
+        texturedA.vertices[0].x = 8; texturedA.vertices[0].y = 4;
+        texturedA.vertices[1].x = 24; texturedA.vertices[1].y = 20;
+        texturedA.vertices[0].u = 0u; texturedA.vertices[0].v = 0u;
+        texturedA.vertices[1].u = 16u * 16u; texturedA.vertices[1].v = 16u * 16u;
+        GSPrimitiveBatch texturedB = texturedA;
+        texturedB.state.context.frame.fbp = 110u;
+        texturedB.vertices[0].x = 72; texturedB.vertices[0].y = 4;
+        texturedB.vertices[1].x = 88; texturedB.vertices[1].y = 20;
+        GSPrimitiveBatch texturedAlias = texturedB;
+        texturedAlias.state.context.frame.fbp = 120u;
+        texturedAlias.state.context.tex0.tbp0 = 100u * 32u; // Reads the first draw's target pages.
+        {
+            GSSDLGpuRaster texturedGpu(texturedGpuVram.data(), texturedClut.data());
+            texturedGpu.submit(texturedA, 8, 4, 23, 19, false, false);
+            texturedGpu.textureFlush();
+            texturedGpu.submit(texturedB, 72, 4, 87, 19, false, false);
+            texturedGpu.submit(texturedAlias, 72, 4, 87, 19, false, false);
+            texturedBatchedDrawCount = texturedGpu.batchedDraws();
+            texturedGpu.sync();
+            texturedRasterPassCount = texturedGpu.rasterDrawPasses();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend texturedCpu;
+            texturedCpu.Initialize(texturedCpuVram.data(), bytes);
+            texturedCpu.Submit(texturedA);
+            texturedCpu.TextureFlush();
+            texturedCpu.Submit(texturedB);
+            texturedCpu.Submit(texturedAlias);
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        texturedFullVramMatchesCpu = texturedGpuVram == texturedCpuVram;
+        gpuTexturedDisjointDrawsMatchCpu = texturedBatchedDrawCount == 1u &&
+            texturedRasterPassCount == 2u && texturedFullVramMatchesCpu;
+
+        // TEXFLUSH has no cache work in this direct-VRAM shader. These partial
+        // uploads touch disjoint rows in one GS page and should stay batched.
+        // Host-to-local is direction 0; the default transfer direction is 3.
+        std::vector<uint8_t> imageChunkGpuVram(bytes, 0u);
+        std::vector<uint8_t> imageChunkCpuVram(bytes, 0u);
+        GSTransferCommand imageChunkA{};
+        imageChunkA.direction = 0u;
+        imageChunkA.bitbltbuf.dbp = 3200u;
+        imageChunkA.bitbltbuf.dbw = 1u;
+        imageChunkA.bitbltbuf.dpsm = GS_PSM_CT32;
+        imageChunkA.trxreg.rrw = 16u;
+        imageChunkA.trxreg.rrh = 16u;
+        GSTransferCommand imageChunkB = imageChunkA;
+        imageChunkB.trxpos.dsay = 2u;
+        std::array<uint32_t, 16> imageChunkPixelsA{}, imageChunkPixelsB{};
+        for (uint32_t i = 0; i < 16u; ++i)
+        {
+            imageChunkPixelsA[i] = 0xff000000u | (i * 0x010101u);
+            imageChunkPixelsB[i] = 0xff000000u | (0x00ffffffu - i * 0x010101u);
+        }
+        uint64_t imageChunkBatchCount = 0u, imageChunkCount = 0u;
+        {
+            GSSDLGpuRaster imageChunkGpu(imageChunkGpuVram.data(), texturedClut.data());
+            imageChunkGpu.uploadImage(imageChunkA, 0u,
+                reinterpret_cast<const uint8_t *>(imageChunkPixelsA.data()), 16u);
+            imageChunkGpu.textureFlush();
+            imageChunkGpu.uploadImage(imageChunkB, 0u,
+                reinterpret_cast<const uint8_t *>(imageChunkPixelsB.data()), 16u);
+            imageChunkGpu.sync();
+            imageChunkBatchCount = imageChunkGpu.imageUploadBatches();
+            imageChunkCount = imageChunkGpu.imageUploadChunks();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend imageChunkCpu;
+            imageChunkCpu.Initialize(imageChunkCpuVram.data(), bytes);
+            imageChunkCpu.BeginTransfer(imageChunkA);
+            imageChunkCpu.UploadImage(reinterpret_cast<const uint8_t *>(imageChunkPixelsA.data()), sizeof(imageChunkPixelsA));
+            imageChunkCpu.TextureFlush();
+            imageChunkCpu.BeginTransfer(imageChunkB);
+            imageChunkCpu.UploadImage(reinterpret_cast<const uint8_t *>(imageChunkPixelsB.data()), sizeof(imageChunkPixelsB));
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        gpuDisjointImageChunksBatchMatchCpu = imageChunkGpuVram == imageChunkCpuVram &&
+            imageChunkBatchCount == 1u && imageChunkCount == 2u;
+
+        // Exercise actual LOD selection in one draw: Q=.25 selects mip level 2.
+        // This isolates TEX1/MIPTBP sampling from batching and feedback hazards.
+        std::vector<uint8_t> mipGpuVram = texturedCpuVram;
+        std::vector<uint8_t> mipCpuVram = texturedCpuVram;
+        for (uint32_t y = 0; y < 4u; ++y)
+            for (uint32_t x = 0; x < 4u; ++x)
+            {
+                const uint32_t color = 0xff000000u | (x * 31u << 16u) | (y * 29u << 8u) | (x + y);
+                GSMem::WriteCT32(mipGpuVram.data(), 416u, 1u, x, y, color);
+                GSMem::WriteCT32(mipCpuVram.data(), 416u, 1u, x, y, color);
+            }
+        GSPrimitiveBatch mipDraw = texturedA;
+        mipDraw.state.context.frame.fbp = 130u;
+        mipDraw.state.prim.fst = false;
+        mipDraw.state.context.tex1 = 0x88u; // LCM=0, MXL=2, MMIN=2.
+        mipDraw.state.context.miptbp1 = 416u | (1u << 14u) | (416u << 20u) | (1ull << 34u);
+        mipDraw.vertices[0].s = 0.0f; mipDraw.vertices[0].t = 0.0f;
+        mipDraw.vertices[1].s = 16.0f; mipDraw.vertices[1].t = 16.0f;
+        mipDraw.vertices[0].q = mipDraw.vertices[1].q = 0.25f;
+        GSPrimitiveBatch mipDrawB = mipDraw;
+        mipDrawB.state.context.frame.fbp = 140u;
+        mipDrawB.vertices[0].x += 64.0f; mipDrawB.vertices[1].x += 64.0f;
+        uint64_t mipBatchedDraws = 0u;
+        uint64_t mipRasterPasses = 0u;
+        {
+            GSSDLGpuRaster mipGpu(mipGpuVram.data(), texturedClut.data());
+            mipGpu.submit(mipDraw, 8, 4, 23, 19, false, false);
+            mipGpu.submit(mipDrawB, 72, 4, 87, 19, false, false);
+            mipBatchedDraws = mipGpu.batchedDraws();
+            mipGpu.sync();
+            mipRasterPasses = mipGpu.rasterDrawPasses();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend mipCpu;
+            mipCpu.Initialize(mipCpuVram.data(), bytes);
+            mipCpu.Submit(mipDraw);
+            mipCpu.Submit(mipDrawB);
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        gpuMipLevelMatchesCpu = mipGpuVram == mipCpuVram &&
+            mipBatchedDraws == 0u && mipRasterPasses == 2u;
+
+        // Nonzero MIPTBP is unreachable for MXL=0, MMIN<2, or constant LOD=0.
+        std::vector<uint8_t> mipZeroGpuVram = texturedSeedVram;
+        std::vector<uint8_t> mipZeroCpuVram = texturedSeedVram;
+        GSPrimitiveBatch mipZeroA = mipDraw;
+        mipZeroA.state.context.tex1 = 0x80u; // LCM=0, MXL=0, MMIN=2.
+        mipZeroA.state.context.miptbp1 = 416u | (1u << 14u) | (416u << 20u) | (1ull << 34u);
+        mipZeroA.state.context.scissor.y1 = 127;
+        mipZeroA.vertices[1].x = 72.0f; mipZeroA.vertices[1].y = 68.0f;
+        GSPrimitiveBatch mipZeroB = mipZeroA;
+        mipZeroB.state.context.frame.fbp = 180u;
+        mipZeroB.state.context.tex1 = 0x48u; // MXL=2, MMIN=1: no mip levels.
+        mipZeroB.vertices[0].x += 72.0f; mipZeroB.vertices[1].x += 72.0f;
+        GSPrimitiveBatch mipZeroC = mipZeroA;
+        mipZeroC.state.context.frame.fbp = 230u;
+        mipZeroC.state.context.tex1 = 0x89u; // LCM=1, MXL=2, MMIN=2, K=0.
+        mipZeroC.vertices[0].x += 144.0f; mipZeroC.vertices[1].x += 144.0f;
+        uint64_t mipZeroBatchedDraws = 0u;
+        uint64_t mipZeroRasterPasses = 0u;
+        {
+            GSSDLGpuRaster mipZeroGpu(mipZeroGpuVram.data(), texturedClut.data());
+            mipZeroGpu.submit(mipZeroA, 8, 4, 71, 67, false, false);
+            mipZeroGpu.submit(mipZeroB, 80, 4, 143, 67, false, false);
+            mipZeroGpu.submit(mipZeroC, 152, 4, 215, 67, false, false);
+            mipZeroBatchedDraws = mipZeroGpu.batchedDraws();
+            mipZeroGpu.sync();
+            mipZeroRasterPasses = mipZeroGpu.rasterDrawPasses();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend mipZeroCpu;
+            mipZeroCpu.Initialize(mipZeroCpuVram.data(), bytes);
+            mipZeroCpu.Submit(mipZeroA);
+            mipZeroCpu.Submit(mipZeroB);
+            mipZeroCpu.Submit(mipZeroC);
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        gpuMiptbpMxlZeroBatchMatchesCpu = mipZeroGpuVram == mipZeroCpuVram &&
+            mipZeroBatchedDraws == 2u && mipZeroRasterPasses == 1u;
+
+        // Reproduce the formerly failing feedback sequence with nonzero mip
+        // registers while LCM=1 keeps the selected level at zero.
+        std::vector<uint8_t> mipAliasGpuVram = texturedSeedVram;
+        std::vector<uint8_t> mipAliasCpuVram = texturedSeedVram;
+        GSPrimitiveBatch mipAliasA = texturedA;
+        mipAliasA.state.context.tex1 = 0x85u;
+        mipAliasA.state.context.miptbp1 = 416u | (1u << 14u) | (416u << 20u) | (1ull << 34u);
+        GSPrimitiveBatch mipAliasB = texturedB;
+        mipAliasB.state.context.tex1 = mipAliasA.state.context.tex1;
+        mipAliasB.state.context.miptbp1 = mipAliasA.state.context.miptbp1;
+        GSPrimitiveBatch mipAliasRead = texturedAlias;
+        mipAliasRead.state.context.tex1 = mipAliasA.state.context.tex1;
+        mipAliasRead.state.context.miptbp1 = mipAliasA.state.context.miptbp1;
+        uint64_t mipAliasBatchedDraws = 0u;
+        uint64_t mipAliasRasterPasses = 0u;
+        {
+            GSSDLGpuRaster mipAliasGpu(mipAliasGpuVram.data(), texturedClut.data());
+            mipAliasGpu.submit(mipAliasA, 8, 4, 23, 19, false, false);
+            mipAliasGpu.submit(mipAliasB, 72, 4, 87, 19, false, false);
+            mipAliasGpu.submit(mipAliasRead, 72, 4, 87, 19, false, false);
+            mipAliasBatchedDraws = mipAliasGpu.batchedDraws();
+            mipAliasGpu.sync();
+            mipAliasRasterPasses = mipAliasGpu.rasterDrawPasses();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend mipAliasCpu;
+            mipAliasCpu.Initialize(mipAliasCpuVram.data(), bytes);
+            mipAliasCpu.Submit(mipAliasA);
+            mipAliasCpu.Submit(mipAliasB);
+            mipAliasCpu.Submit(mipAliasRead);
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        gpuMipAliasMatchesCpu = mipAliasGpuVram == mipAliasCpuVram &&
+            mipAliasBatchedDraws == 0u && mipAliasRasterPasses == 3u;
+
+        std::vector<uint8_t> batchCapacityGpuVram(bytes, 0);
+        std::vector<uint8_t> batchCapacityCpuVram(bytes, 0);
+        std::array<uint16_t, 512> batchCapacityClut{};
+        uint64_t capacityBatchedDraws = 0u;
+        uint64_t capacityRasterPasses = 0u;
+        {
+            GSSDLGpuRaster batchGpu(batchCapacityGpuVram.data(), batchCapacityClut.data());
+            for (uint32_t i = 0; i < 129u; ++i)
+            {
+                GSPrimitiveBatch draw{};
+                draw.vertexCount = 2;
+                draw.state.prim.type = GS_PRIM_SPRITE;
+                draw.state.context.frame.fbp = 200u + i;
+                draw.state.context.frame.fbw = 10u;
+                draw.state.context.frame.psm = GS_PSM_CT32;
+                draw.state.context.zbuf.psm = GS_PSM_Z24;
+                draw.state.context.zbuf.zmask = true;
+                draw.state.context.test = 1ull << 17u;
+                draw.state.context.scissor = {0, 255, 0, 63};
+                draw.vertices[0].x = 1; draw.vertices[0].y = 1;
+                draw.vertices[1].x = 3; draw.vertices[1].y = 3;
+                for (auto &vertex : draw.vertices)
+                {
+                    vertex.r = static_cast<uint8_t>(i);
+                    vertex.g = static_cast<uint8_t>(i >> 1u);
+                    vertex.b = 0x5au;
+                    vertex.a = 255u;
+                }
+                batchGpu.submit(draw, 1, 1, 2, 2, false, false);
+            }
+            capacityBatchedDraws = batchGpu.batchedDraws();
+            batchGpu.sync();
+            capacityRasterPasses = batchGpu.rasterDrawPasses();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend batchCpu;
+            batchCpu.Initialize(batchCapacityCpuVram.data(), bytes);
+            for (uint32_t i = 0; i < 129u; ++i)
+            {
+                GSPrimitiveBatch draw{};
+                draw.vertexCount = 2;
+                draw.state.prim.type = GS_PRIM_SPRITE;
+                draw.state.context.frame.fbp = 200u + i;
+                draw.state.context.frame.fbw = 10u;
+                draw.state.context.frame.psm = GS_PSM_CT32;
+                draw.state.context.zbuf.psm = GS_PSM_Z24;
+                draw.state.context.zbuf.zmask = true;
+                draw.state.context.test = 1ull << 17u;
+                draw.state.context.scissor = {0, 255, 0, 63};
+                draw.vertices[0].x = 1; draw.vertices[0].y = 1;
+                draw.vertices[1].x = 3; draw.vertices[1].y = 3;
+                for (auto &vertex : draw.vertices)
+                {
+                    vertex.r = static_cast<uint8_t>(i);
+                    vertex.g = static_cast<uint8_t>(i >> 1u);
+                    vertex.b = 0x5au;
+                    vertex.a = 255u;
+                }
+                batchCpu.Submit(draw);
+            }
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        gpuRasterBatchCapacityMatchesCpu = capacityBatchedDraws == 127u &&
+            capacityRasterPasses == 2u && batchCapacityGpuVram == batchCapacityCpuVram;
+
+        GSPrimitiveBatch orderedA{};
+        orderedA.vertexCount = 2;
+        orderedA.state.prim.type = GS_PRIM_SPRITE;
+        orderedA.state.context.frame.fbp = 160u;
+        orderedA.state.context.frame.fbw = 10u;
+        orderedA.state.context.frame.psm = GS_PSM_CT32;
+        orderedA.state.context.zbuf.zbp = 210u;
+        orderedA.state.context.zbuf.psm = GS_PSM_Z24;
+        orderedA.state.context.zbuf.zmask = false;
+        orderedA.state.context.test = 1ull << 17u;
+        orderedA.state.context.scissor = {0, 255, 0, 63};
+        orderedA.vertices[0].x = 8; orderedA.vertices[0].y = 8;
+        orderedA.vertices[1].x = 20; orderedA.vertices[1].y = 20;
+        orderedA.vertices[0].z = orderedA.vertices[1].z = 10.0;
+        for (auto &vertex : orderedA.vertices)
+        {
+            vertex.r = 0xe0; vertex.g = 0x20; vertex.b = 0x10; vertex.a = 255u;
+        }
+        GSPrimitiveBatch orderedB = orderedA;
+        orderedB.vertices[0].x = 14; orderedB.vertices[0].y = 14;
+        orderedB.vertices[1].x = 26; orderedB.vertices[1].y = 26;
+        orderedB.vertices[0].z = orderedB.vertices[1].z = 20.0;
+        for (auto &vertex : orderedB.vertices)
+        {
+            vertex.r = 0x10; vertex.g = 0x40; vertex.b = 0xd0; vertex.a = 255u;
+        }
+        std::vector<uint8_t> orderedGpuVram(bytes, 0), orderedCpuVram(bytes, 0);
+        std::array<uint16_t, 512> orderedClut{};
+        uint64_t orderedBatchedDraws = 0u, orderedRasterPasses = 0u;
+        {
+            GSSDLGpuRaster orderedGpu(orderedGpuVram.data(), orderedClut.data());
+            orderedGpu.submit(orderedA, 8, 8, 19, 19, false, false);
+            orderedGpu.submit(orderedB, 14, 14, 25, 25, false, false);
+            orderedBatchedDraws = orderedGpu.batchedDraws();
+            orderedGpu.sync();
+            orderedRasterPasses = orderedGpu.rasterDrawPasses();
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend orderedCpu;
+            orderedCpu.Initialize(orderedCpuVram.data(), bytes);
+            orderedCpu.Submit(orderedA);
+            orderedCpu.Submit(orderedB);
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        gpuRasterOrderedBatchMatchesCpu = orderedBatchedDraws == 1u && orderedRasterPasses == 1u &&
+            orderedGpuVram == orderedCpuVram;
+
         GSPrimitiveBatch nonfiniteSprite{};
         nonfiniteSprite.vertexCount = 2;
         nonfiniteSprite.state.prim.type = GS_PRIM_SPRITE;
@@ -593,19 +938,71 @@ int main()
             gpu.loadClut(tex, GSTexClutReg{}); // Identical source must reuse the GPU CLUT.
             GSTex0Reg secondTex = tex;
             secondTex.cbp = 1024u;
+            secondTex.csa = 1u; // A partial load must preserve the first CSA bank.
             gpu.loadClut(secondTex, GSTexClutReg{});
             gpu.loadClut(tex, GSTexClutReg{}); // A second slot keeps the first palette resident.
-            const bool repeatedLoadReused = gpu.clutLoadCacheHits() == 2u &&
-                gpu.clutLoadDispatches() == 2u;
+            GSTex0Reg overlappingTex = secondTex;
+            overlappingTex.csa = 0u;
+            gpu.loadClut(overlappingTex, GSTexClutReg{}); // Overwrite A's bank.
+            gpu.loadClut(tex, GSTexClutReg{}); // Restore A from cache without rolling back B.
+            const bool repeatedLoadReused = gpu.clutLoadCacheHits() == 3u &&
+                gpu.clutLoadDispatches() == 3u;
+            gpu.sync();
+            const bool partialBanksPreserved = clut[0] == 0x6699u && clut[256] == 0xff33u &&
+                clut[16] == 0x3456u && clut[272] == 0xff12u;
             GSMem::WriteCT32(packedScanoutVram.data(), paletteBp, 1, 0, 0, 0xffabcdefu);
             gpu.markHostDirty(); // Host upload overlaps the cached CLUT source page.
             gpu.loadClut(tex, GSTexClutReg{});
             gpu.sync();
-            clutCachePassed = repeatedLoadReused && gpu.clutLoadCacheHits() == 2u &&
-                gpu.clutLoadDispatches() == 3u && clut[0] == 0xcdefu && clut[256] == 0xffabu;
+            clutCachePassed = repeatedLoadReused && partialBanksPreserved && gpu.clutLoadCacheHits() == 3u &&
+                gpu.clutLoadDispatches() == 4u && clut[0] == 0xcdefu && clut[256] == 0xffabu;
             clutCacheHits = gpu.clutLoadCacheHits();
             clutCacheDispatches = gpu.clutLoadDispatches();
         }
+        // Integrated GS path: loading CSA1 must not discard CSA0. CLD0 draws
+        // then consume both retained banks without another VRAM palette load.
+        std::vector<uint8_t> sharedBankGpuVram(bytes, 0u);
+        GSMem::WriteCT32(sharedBankGpuVram.data(), paletteBp, 1u, 0u, 0u, paletteColor);
+        GSMem::WriteCT32(sharedBankGpuVram.data(), 1024u, 1u, 0u, 0u, 0xff123456u);
+        std::vector<uint8_t> sharedBankCpuVram = sharedBankGpuVram;
+        const auto drawSharedBanks = [&](GSCpuBackend &backend)
+        {
+            GSTex0Reg bankA = tex;
+            bankA.tbp0 = 3000u; bankA.tbw = 1u; bankA.tw = 4u; bankA.th = 4u;
+            bankA.tcc = 1u; bankA.tfx = 1u;
+            GSTex0Reg bankB = bankA;
+            bankB.cbp = 1024u; bankB.csa = 1u;
+            backend.LoadClut(bankA, GSTexClutReg{});
+            backend.LoadClut(bankB, GSTexClutReg{});
+            GSPrimitiveBatch draw = texturedA;
+            draw.state.context.tex0 = bankA;
+            draw.state.context.tex0.cld = 0u;
+            backend.LoadClut(draw.state.context.tex0, GSTexClutReg{});
+            backend.Submit(draw);
+            draw.state.context.frame.fbp = 110u;
+            draw.state.context.tex0 = bankB;
+            draw.state.context.tex0.cld = 0u;
+            backend.LoadClut(draw.state.context.tex0, GSTexClutReg{});
+            backend.Submit(draw);
+        };
+        {
+            GSCpuBackend gpu;
+            gpu.Initialize(sharedBankGpuVram.data(), bytes);
+            drawSharedBanks(gpu);
+            gpu.SnapshotVram(sharedBankGpuVram);
+        }
+        unsetenv("PS2X_GS_SDL_GPU");
+        {
+            GSCpuBackend cpu;
+            cpu.Initialize(sharedBankCpuVram.data(), bytes);
+            drawSharedBanks(cpu);
+        }
+        if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        GSMem::TexturePageCache sharedBankCache;
+        const bool sharedBankDrawsPassed = sharedBankGpuVram == sharedBankCpuVram &&
+            GSMem::ReadTexture(sharedBankCache, sharedBankGpuVram.data(), GS_PSM_CT32, 3200u, 10u, 10u, 6u) == paletteColor &&
+            GSMem::ReadTexture(sharedBankCache, sharedBankGpuVram.data(), GS_PSM_CT32, 3520u, 10u, 10u, 6u) == 0xff123456u;
+        clutCachePassed = clutCachePassed && sharedBankDrawsPassed;
         const bool rasterPassed = rasterPixel == 0xff996633u;
         const bool dither16Passed = dither16Pixel == 0xb989u;
         const bool tinyRasterPassed = tinyRasterPixel == 0xff563412u;
@@ -638,6 +1035,53 @@ int main()
             gpuAliasedDepthMatchesCpu ? "PASS" : "FAIL");
         std::printf("SDL_GPU Metal GS disjoint draw batching differential: %s (full VRAM matches CPU)\n",
             gpuDisjointDrawsMatchCpu ? "PASS" : "FAIL");
+        std::printf("SDL_GPU Metal GS textured batching hazards: %s (disjoint draws batch across TEXFLUSH; texture feedback splits it; full VRAM matches CPU)\n",
+            gpuTexturedDisjointDrawsMatchCpu ? "PASS" : "FAIL");
+        if (!gpuTexturedDisjointDrawsMatchCpu)
+                std::printf("  detail: batched draws=%llu (expected 1), raster passes=%llu (expected 2), full VRAM=%s\n",
+                static_cast<unsigned long long>(texturedBatchedDrawCount),
+                static_cast<unsigned long long>(texturedRasterPassCount),
+                texturedFullVramMatchesCpu ? "matches" : "DIFFERS");
+        std::printf("SDL_GPU Metal GS TEXFLUSH-deferred image batch: %s (2 uploads share 1 batch; full VRAM matches CPU)\n",
+            gpuDisjointImageChunksBatchMatchCpu ? "PASS" : "FAIL");
+        if (!gpuDisjointImageChunksBatchMatchCpu)
+        {
+            std::printf("  detail: batches=%llu (expected 1), chunks=%llu (expected 2), full VRAM=%s\n",
+                static_cast<unsigned long long>(imageChunkBatchCount),
+                static_cast<unsigned long long>(imageChunkCount),
+                imageChunkGpuVram == imageChunkCpuVram ? "matches" : "DIFFERS");
+            for (size_t i = 0; i < imageChunkGpuVram.size(); ++i)
+                if (imageChunkGpuVram[i] != imageChunkCpuVram[i])
+                {
+                    std::printf("  first VRAM difference at byte %zu: GPU=%02x CPU=%02x\n", i,
+                        imageChunkGpuVram[i], imageChunkCpuVram[i]);
+                    break;
+                }
+        }
+        std::printf("SDL_GPU Metal GS mip LOD differential: %s (two Q=.25 draws select MIPTBP1 level 2; full VRAM matches CPU)\n",
+            gpuMipLevelMatchesCpu ? "PASS" : "FAIL");
+        std::printf("SDL_GPU Metal GS base-level-only mip batching: %s (MXL=0, MMIN<2, and constant LOD=0; area >=4096; one batch and full VRAM matches CPU)\n",
+            gpuMiptbpMxlZeroBatchMatchesCpu ? "PASS" : "FAIL");
+        if (!gpuMiptbpMxlZeroBatchMatchesCpu)
+        {
+            std::printf("  detail: batched draws=%llu (expected 2), raster passes=%llu (expected 1), full VRAM=%s\n",
+                static_cast<unsigned long long>(mipZeroBatchedDraws),
+                static_cast<unsigned long long>(mipZeroRasterPasses),
+                mipZeroGpuVram == mipZeroCpuVram ? "matches" : "DIFFERS");
+            const auto mismatch = std::mismatch(mipZeroGpuVram.begin(), mipZeroGpuVram.end(), mipZeroCpuVram.begin());
+            if (mismatch.first != mipZeroGpuVram.end())
+            {
+                const size_t offset = static_cast<size_t>(mismatch.first - mipZeroGpuVram.begin());
+                std::printf("  first VRAM difference at byte %zu: GPU=%02x CPU=%02x\n", offset,
+                    *mismatch.first, *mismatch.second);
+            }
+        }
+        std::printf("SDL_GPU Metal GS TEX1/MIPTBP alias differential: %s (LOD=0 mip registers stay isolated around feedback; full VRAM matches CPU)\n",
+            gpuMipAliasMatchesCpu ? "PASS" : "FAIL");
+        std::printf("SDL_GPU Metal GS raster batch capacity: %s (129 disjoint draws -> 2 dispatches; full VRAM matches CPU)\n",
+            gpuRasterBatchCapacityMatchesCpu ? "PASS" : "FAIL");
+        std::printf("SDL_GPU Metal GS ordered overlap batch: %s (overlapping same-target draws -> 1 dispatch; GS order and full VRAM match CPU)\n",
+            gpuRasterOrderedBatchMatchesCpu ? "PASS" : "FAIL");
         std::printf("SDL_GPU Metal GS non-finite STQ normalization: %s (matches explicit zero T)\n",
             gpuNonfiniteMatchesExplicit ? "PASS" : "FAIL");
         std::printf("SDL_GPU GS GPU-only guard: %s (unsupported AA1 draw throws before CPU rasterization)\n",
@@ -669,10 +1113,10 @@ int main()
             gpuPresentCt24Pixel, gpuPresentCt16Pixel);
         std::printf("SDL_GPU Metal GS CLUT smoke: %s (entry=%04x:%04x expected=ffab:cdef)\n",
             clutPassed ? "PASS" : "FAIL", clut[256], clut[0]);
-        std::printf("SDL_GPU Metal GS CLUT cache/invalidation: %s (hits=%llu dispatches=%llu)\n",
+        std::printf("SDL_GPU Metal GS CLUT cache/invalidation: %s (shared CSA banks, CLD0 draws, full VRAM differential; hits=%llu dispatches=%llu)\n",
             clutCachePassed ? "PASS" : "FAIL", static_cast<unsigned long long>(clutCacheHits),
             static_cast<unsigned long long>(clutCacheDispatches));
-        return rasterPassed && gpuLineMatchesCpu && gpuAliasedDepthMatchesCpu && gpuDisjointDrawsMatchCpu && gpuNonfiniteMatchesExplicit && gpuOnlyGuardPassed && dither16Passed && tinyRasterPassed && clearPassed && uploadPassed && ct24UploadPassed && compactUploadPassed && overlapUploadsPassed && localCopyPassed && overlapCopyPassed && localReadbackPassed && packedReadbackPassed && nibbleReadbackPassed && gpuPresentPassed && gpuAsyncPresentPassed && gpuPresentPackedPassed && clutPassed ? 0 : 1;
+        return rasterPassed && gpuLineMatchesCpu && gpuAliasedDepthMatchesCpu && gpuDisjointDrawsMatchCpu && gpuTexturedDisjointDrawsMatchCpu && gpuDisjointImageChunksBatchMatchCpu && gpuMipLevelMatchesCpu && gpuMiptbpMxlZeroBatchMatchesCpu && gpuMipAliasMatchesCpu && gpuRasterBatchCapacityMatchesCpu && gpuRasterOrderedBatchMatchesCpu && gpuNonfiniteMatchesExplicit && gpuOnlyGuardPassed && dither16Passed && tinyRasterPassed && clearPassed && uploadPassed && ct24UploadPassed && compactUploadPassed && overlapUploadsPassed && localCopyPassed && overlapCopyPassed && localReadbackPassed && packedReadbackPassed && nibbleReadbackPassed && gpuPresentPassed && gpuAsyncPresentPassed && gpuPresentPackedPassed && clutPassed ? 0 : 1;
     }
     catch (const std::exception &e)
     {
