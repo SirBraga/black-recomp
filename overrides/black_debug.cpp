@@ -663,8 +663,10 @@ namespace
                          readU32(rdram, spCtor + 0x00));
         }
         char path[128] = {};
+        uint32_t fsObj = 0;
         if (h.addr == 0x0027CAB8u)
         {
+            fsObj = reg(ctx, 4) & 0x01FFFFFFu;
             const uint32_t p = reg(ctx, 5) & 0x01FFFFFFu;
             for (size_t i = 0; i + 1 < sizeof(path) && p + i < PS2_RAM_SIZE && rdram[p + i]; ++i)
                 path[i] = static_cast<char>(rdram[p + i]);
@@ -756,7 +758,8 @@ namespace
                          vt ? readU32(rdram, vt + 0x14u) : 0u, vt ? readU32(rdram, vt + 0x0Cu) : 0u);
         }
         if (h.addr == 0x0027CAB8u)
-            std::fprintf(stderr, "[black-fs] open \"%s\" -> 0x%08x\n", path, reg(ctx, 2));
+            std::fprintf(stderr, "[black-fs] open \"%s\" -> 0x%08x err=%u handles=%u ra=0x%08x\n", path, reg(ctx, 2),
+                         readU32(rdram, fsObj + 0x104u), readU32(rdram, fsObj + 0x108u), raIn);
         if (logThis)
             std::fprintf(stderr,
                          "[black-dbg]   leave %s pc=0x%08x (ra_in=0x%08x) s0=0x%08x (in 0x%08x) sp=0x%08x (in 0x%08x) "

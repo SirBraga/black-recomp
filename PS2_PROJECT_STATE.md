@@ -710,3 +710,218 @@ Validação (`bash ps2recomp/diagnostics/TestarPath3Gate.command [default|gate|b
 Patch `0001-black-runtime-fixes.patch` regenerado com o comando do SKILL §0 (67 arquivos; inclui também o backend SDL_GPU que estava fora do 0001 desde 2026-10-05). `PS2Recomp-local-changes.patch`, citado no README, **não** foi regenerado e não contém o gate.
 
 Limites: o roteiro de pad chega ao Level_00 em updates diferentes entre runs (826–1861) e às vezes a janela termina ainda no texto "4 DAYS EARLIER"; o tempo de guest avança ~1 s a cada 30 updates. O `PS2X_GIF_INCREMENTAL` segue ligado por padrão e não atua aqui porque as cadeias chegam mascaradas.
+
+### Desempenho no Level_00: onde o tempo vai — 2026-10-07
+
+Medições com SDL_GPU, gate do PATH3 ligado, mesmo roteiro de pad, sala inicial do Level_00 (arquivos em `recomp/diagnostics/perf-level00/`, `*-sample.txt` são perfis `sample` de 5–10 s):
+
+- **Sem hooks de debug (`BLACK_FPS=1`): ~2,0 updates/s** com uma travada de ~2 s a cada ~10 s (média ~1,6). Com `BLACK_DEBUG=1` cai para ~0,8 porque `traceGs` → `ReadVram` → `GSSDLGpuRaster::sync()` espera a GPU inteira a cada dump; os números de upd/s medidos com debug não valem como desempenho.
+- A fase submete **~82 mil triângulos por update**; 98% viravam um compute pass individual (~165 mil passes/s). 96% das recusas de lote eram "texture": o draw tem registradores MIPTBP (metade mip amostrável, metade só nível base com área < 4096 px). Áreas: a maioria ≤ 64 px.
+- A travada periódica é o wrap da arena de upload de 128 MiB (`stageUploadDataParts`), que submete e espera a fence: a GPU acumula segundos de atraso.
+- **Teto sem nenhum raster** (draws descartados em `submit`, diagnóstico temporário já removido): **3,7 updates/s**. Nesse perfil ~80% da thread do jogo é o interpretador da VU1 (`run` 29%, `commitReadyPipelines` 12%, `execUpper` 10%, `execLower` 7%, flags/sticky FMAC ~14%). Ou seja: raster custa cerca de metade do frame e a VU1 quase toda a outra metade; nenhum dos dois sozinho chega perto de 30 upd/s.
+
+Experimento `PS2X_GS_WIDE_BATCH=1` (opt-in, **desligado por padrão**): inclui as faixas de VRAM dos níveis de mip na checagem de conflito, deixa draws com MIPTBP entrarem em lote e aumenta o lote ordenado para até 128 draws (`PS2X_GS_ORDERED_MAX_DRAWS`) com orçamento de testes de bounds (`PS2X_GS_ORDERED_WORK_BUDGET`, padrão 2^20). Resultado: passes caem 16× (16,5 draws/pass; o limite passa a ser o `finishPass` de cada `loadClut`, ~1 a cada 20 draws), as travadas somem, mas a média fica igual (1,5–1,7 upd/s) — a GPU continua sendo o limite, então o custo dominante não é o número de passes de raster. Orçamentos menores são piores (32768 → 1,1–1,3; 0 → 0,3–1,3): um lote pequeno (blit dos parâmetros + compute) custa mais que passes individuais. **Regressão**: com o lote largo as texturas do mundo corrompem depois de ~190 updates na fase (após o flash em upd≈2021; `run6/default-frame1.png`), enquanto a política antiga fica limpa no mesmo ponto (`legacy-late.png`). Causa não identificada. O smoke `ps2x_sdl_gpu_backend_smoke` passa 25/25 nos dois modos (as duas asserções de mip agora checam a imagem e não a contagem de passes).
+
+Também: o report `[path3-gate]` só sai com `PS2X_PATH3_GATE_STATS` (estava saindo sempre depois de o gate virar padrão). Patch 0001 regenerado.
+
+Próximos passos candidatos, em ordem de custo/benefício estimado: (1) achar o hazard do lote largo e tirar o `finishPass` por CLUT e o blit de parâmetros por lote (meta: raster de ~0,3 s/frame para bem menos, limite 3,7 upd/s); (2) VU1: o AOT atual mantém o loop/filas por par e por isso não ganha; ganho real exige blocos com pipeline/flags resolvidos estaticamente; (3) tirar VU1 e GS da thread do EE.
+
+Bisect da regressão do lote largo: `PS2X_GS_WIDE_BATCH=1` com `PS2X_GS_ORDERED_MAX_DRAWS=16` e `PS2X_GS_ORDERED_WORK_BUDGET=0` (só o mip em lote, limites antigos) fica limpo no mesmo ponto tardio (`recomp/diagnostics/path3-gate/bisect-mip16-late.png`, uma execução). Portanto a corrupção vem dos lotes ordenados grandes (mais de 16 draws e/ou orçamento de trabalho), não das faixas de mip. Os kernels `rasterPixel`/`batchRasterPixel` e `sample`/`batchSample` do shader são textualmente equivalentes; falta verificar hazard de ordem/CLUT com lote grande ou aborto de command buffer longo pelo Metal.
+
+### VU1 recompilada estaticamente — 2026-10-08
+
+Regra do projeto (usuário, 2026-10-07): código que o console executa tem de ser recompilado, não interpretado. A VU1 passou a rodar microcódigo recompilado por padrão; `PS2X_VU_RECOMPILED=0` volta ao interpretador de referência. A VU0 (microprogramas) continua no interpretador de referência.
+
+Como funciona:
+- `ps2x_vu1_recompile` (`ps2recomp/diagnostics/vu1_recompile.cpp`) lê imagens de 16 KiB da memória de código da VU1 e gera `src/lib/vu/black_vu1_recompiled.inc` (local, não versionado: contém código do jogo). Cada imagem vira uma função com um `switch` no PC e fallthrough; cada par alcançável é uma chamada a `VU1Interpreter::stepPair()` com literais. `stepPair` e os corpos das instruções (`ps2_vu1_upper.inl`/`ps2_vu1_lower.inl`, extraídos dos antigos `.cpp`) são inline, então o compilador dobra a decodificação. Os fatos de cada par vêm de `VU1Interpreter::describeImage()`, o mesmo decodificador e a mesma análise do runtime.
+- Semântica: a do modo FastVU do interpretador (mesmos stalls de FDIV/EFU/XGKICK, mesmas filas). Diferenças deliberadas: stores LSU são gravados na hora (equivalente ao commit no ciclo seguinte) e as flags MAC/status de um FMAC só são calculadas quando a análise estática (`analyzeFastPairs`) mostra que algum FMAND/FMEQ/FMOR, um fim de programa ou um salto indireto pode observá-las. Se a imagem tiver qualquer FSEQ/FSSET/FSAND/FSOR tudo fica exato; sem isso os bits sticky Z/S/U/O do status da VU1 não são mantidos (`PS2X_VU_EXACT_FLAGS=1` força exato). Nas 46 imagens: 16.783 escritores de flags, 1.502 ainda calculam.
+- Imagem desconhecida: é interpretada pelo mesmo `stepPair` e avisada em `[vu-recomp]`; com `PS2X_VU_RECOMP_CAPTURE=<dir>` a imagem é salva. `ps2recomp/build_vu_recompiled.sh` regenera a partir de `vu-coverage-level00/`, `vu-trace/images/` e `vu-captured/`, valida e recompila o runner.
+
+Validação:
+- `ps2x_vu1_trace_replay recomp/diagnostics/vu-trace/level00.bin --engine recompiled`: 2.327 execuções reais (`PS2X_VU_TRACE`, execute e resume com pipelines ociosos), 3.171.642 pares, 1.990 pacotes PATH1 — 0 divergências de registradores, memória e pacotes contra a referência (status comparado com máscara 0xC3F), e a referência bate com o resultado gravado no jogo.
+- `PS2X_VU_FAST_VERIFY=<arquivo>` (+ `PS2X_VU_VERIFY_RECOMPILED=1`): execução em sombra dentro do jogo; 262.144 programas sem divergência no recompilado e 786.432 no motor por pares, atravessando a troca de cena.
+- Bancada: 9,1 ns/par contra 46,7 ns/par da referência. No jogo (Level_00, sem hooks de debug): 4,4–5,0 updates/s contra ~2,0; a VU caiu para ~15% da thread do jogo e o resto é GS/GPU.
+- Frame da introdução da fase igual ao anterior (`recomp/diagnostics/path3-gate/recomp-intro.png`).
+
+Pendências conhecidas:
+- **Jogabilidade corrompida em todas as configurações** (inclusive antes desta mudança): os frames "limpos" validados em 2026-10-07 eram da câmera de introdução. Quando o `select` do roteiro inicia a jogabilidade, as texturas do mundo corrompem. Fatos medidos: o dump do PCSX2 tem ~700 uploads por frame intercalados com os draws; o recomp faz ~40 por frame, todos antes dos draws; por frame há uma cadeia VIF1 grande (≈5,7 M ciclos de VU, 15 janelas `MSKPATH3(0) NOP MSKPATH3(1)`, 13 vazias) e uma pequena (4 janelas), com cadeias GIF de 3 pacotes (3896/1798/10485 qw) e 2 pacotes (2/1 qw) disparadas depois de cada uma; o jogo lê GIF_STAT 3×/frame (valores 4, 6 e FQC 0x10/0x03), D1_CHCR e D2_CHCR 1×. Hipóteses abertas: o VIF1 é concluído no próprio kick (no hardware a cadeia GIF disparada 5 mil ciclos depois passaria nas janelas do mesmo frame) e a regra "um pacote por janela" (no PCSX2 a máscara só impede o próximo pacote de começar, e um pacote curto deixa o seguinte passar). `PS2X_DMA_COOPERATIVE=1` agora avança o VIF1 em proporção aos ciclos de EE, mas não corrigiu.
+- VU0 (microprogramas) e IOP continuam interpretados.
+- `PS2X_VU_FAST=1` seleciona o mesmo laço por pares sem o código gerado (útil para isolar o gerador).
+- Os alvos `ps2x_vu1_trace_replay`/`ps2x_vu1_recompile` estão em `ps2xRuntime/CMakeLists.txt`, que não entra no patch 0001.
+
+### VU0 também recompilada; IOP medido — 2026-10-08
+
+- Os microprogramas da VU0 usam o mesmo recompilador e o mesmo padrão (`PS2X_VU_RECOMPILED=0` desliga os dois). Na VU0 todas as flags ficam exatas (o EE as lê por COP2). `PS2X_VU0_TRACE=<arquivo>` grava execuções da VU0; `recomp/diagnostics/vu-trace/vu0-session.bin` tem 8.000 execuções (395.055 pares, 3 imagens): 0 divergências contra a referência e contra o resultado gravado no jogo. Bancada: 28 ns/par contra 52 ns/par (execuções curtas, ~49 pares, dominadas pelo custo fixo por chamada).
+- `build_vu_recompiled.sh` agora cobre `vu0-*.bin` e `vu1-*.bin`, exporta as imagens de todos os traces em `recomp/diagnostics/vu-trace/*.bin` e força a recompilação de `ps2_vu1_core.cpp` (o `__has_include` do arquivo gerado não é visto pelo sistema de build; sem isso o runner ficava sem o código gerado).
+- No jogo, com VU0+VU1 recompiladas: 4,1–5,1 updates/s no Level_00, nenhuma imagem desconhecida no log, frame da introdução inalterado (`recomp/diagnostics/path3-gate/recomp-vu01-intro.png`).
+- Pendente no gerador: imagens capturadas sem cobertura (`vu-captured/`) estão saindo com 0 pares e são interpretadas sem aviso.
+- IOP: no perfil da fase, `IopEmulator::runEeCycles` é 0,5% da thread do jogo e `IopCpuCore::executeInstruction` 0,3% (o IOP fica quase todo ocioso). Os módulos são 9 IRX do disco (`recomp/disc/IOP`: DBCMAN, DS2O, DSPROUTE, GTFSCDVD, LIBSD, MC2_D, RWA, SIO2D, SIO2MAN) carregados e relocados em tempo de execução. Recompilar é viável pela mesma técnica (capturar o texto já relocado e gerar C++ com cada instrução fixada como constante), mas não muda updates/s; ainda não foi iniciado.
+- Para comparação, no mesmo perfil `GS::processGIFPacket` é 68,6% da thread do jogo e o código recompilado da VU 16,2%.
+
+### Backend SDL_GPU: passes por frame e contrapressão — 2026-10-08
+
+Medido no Level_00 (câmera de introdução), sem hooks de debug, VU0/VU1 recompiladas. Estado anterior: 4,4–5,0 updates/s com travadas e 53% da thread do jogo em `GSSDLGpuRaster::submit` (um compute pass por triângulo).
+
+- A corrupção "do lote largo" de 2026-10-07 era a corrupção da jogabilidade (existe em todas as configurações, inclusive no raster de CPU: `recomp/diagnostics/path3-gate/cpu-gameplay.png`). O lote largo voltou a ser o padrão (`PS2X_GS_WIDE_BATCH=0` desliga).
+- Um blit para um buffer seguido de um compute pass que o lê custa à GPU dezenas de vezes mais que um pass com dados em uniform. Por isso: lotes ordenados de até 64 draws vão como uniform (`rasterOrderedUniform`: cabeçalho + tabela compacta de retângulos + `Params`), lotes de upload de imagem ≤ 32 KB vão como uniform (`imageUploadUniform`), e o miss do cache de CLUT preenche o slot com um segundo dispatch em vez de um blit.
+- Hits do cache de CLUT não copiam mais para o slot 0 na hora: o draw cujo TEX0 coincide com o último load amostra o slot do cache (`p[46]`), e os loads pendentes só são reaplicados em ordem (`materializeClut`) quando algo precisa do slot 0. Trocar de paleta deixou de quebrar o lote.
+- Scanout: o host apresenta muito mais vezes do que o jogo fecha frames; se nada escreveu na faixa de VRAM exibida desde o último scanout da mesma fonte, reaproveita a imagem (sem trabalho de GPU).
+- Contrapressão: com os três slots de scanout em voo, `submit` espera o mais antigo. Sem isso a CPU produzia 6–7 updates/s e a fila da GPU crescia até uma travada de 5–9 s.
+- Teste de profundidade antecipado nos kernels (`rasterPixel`/`batchRasterPixel`) quando o teste de alfa não pode falhar: 4,1 → 4,8 updates/s.
+- Sensibilidade medida com contrapressão (taxa = limite da GPU): 10 draws/pass → 2,6; 13 → 3,0; 35 → 4,1; orçamento de testes 16× maior não muda nada; kernel ordenado sem fazer nada → 6,7 (limite da CPU). Ou seja, o custo dominante da GPU é o sombreamento por pixel coberto, não o número de passes nem os testes de retângulo.
+- Resultado: **4,7–5,0 updates/s estáveis, sem travadas**, contra 4,4–5,0 com travadas de vários segundos. O smoke `ps2x_sdl_gpu_backend_smoke` passa 25/25 e o frame da introdução está igual (`gs-batch-intro.png`).
+
+Próximo teto: a fase tem overdraw alto (estimativa pelas áreas dos retângulos: dezenas de milhões de pixel-draws por update) e cada pixel-draw no kernel faz 6–7 leituras aleatórias de VRAM/LUT/CLUT. Chegar perto de 30 updates/s pede o rasterizador nativo da GPU com cache de texturas, não mais ajuste do kernel de compute.
+
+### Corrupção na jogabilidade do Level_00: o que está estabelecido — 2026-10-08
+
+Sintoma: depois do fim da introdução (upd≈2011, flash) a imagem **alterna** entre frames corretos e frames com as texturas do mundo em lixo, na mesma câmera (`recomp/diagnostics/path3-gate/four-frames.png`: 2161 lixo, 2171/2181 corretos, 2191 lixo). A média de brilho do dump distingue: ~52/49 correto, ~40 lixo. Vale para VU de referência ou recompilada, raster de CPU ou GPU, gate ligado ou desligado, DMA síncrono ou cooperativo.
+
+Descartado, com evidência:
+- **Raster/GPU**: o raster de CPU mostra o mesmo (`cpu-gameplay.png`), e uma simulação independente da VRAM em Python, só com os uploads capturados, decodifica o mesmo lixo (`stream-decode.png`).
+- **VU**: execução em sombra sem divergência; `PS2X_VU_RECOMPILED=0` dá a mesma série.
+- **Swizzle**: tabelas de bloco e de coluna (CT32/CT16/T8/T4) conferidas com as do hardware.
+- **Ordem dos kicks**: o gerenciador de DMA do jogo (`func_002B2638`, fila com entradas 0x21 = par GIF+VIF1, 0x01/0x02, 0x40/0x41 = flip, 0x42 = decremento de contador, 0x4F = callback, 0x7F = salto) dispara a cadeia GIF de texturas imediatamente antes da cadeia VIF1 que a usa: mascara o PATH3 escrevendo `MSKPATH3` na FIFO do VIF1, espera `GIF_STAT.M3P`, põe `GIF_MODE=IMT`, dá o kick do GIF, espera `FQC != 0` e só então dá o kick do VIF1; antes de cada par espera D1/D2 sem STR, `VIF1_STAT & 0x1F000003 == 0`, VU1 parada e `GIF_STAT & 0xC00 == 0`. Adiar o VIF1 (`PS2X_VIF1_DEFER`, experimento removido) mostrou que o jogo nunca dá o kick do GIF "durante" o VIF1 anterior. `func_002B2BA8` é o tratador de VSync (limitador de frames, flip e kick da cadeia de 56 qw).
+- **Conclusão do canal GIF no esvaziamento da fila mascarada** (`PS2X_GIF_COMPLETE_ON_DRAIN=1`, opt-in): fiel ao hardware, mas não altera o stream.
+- **Tags DMA**: nos frames ruins a cadeia GIF do par grande é uma única tag `end` com 3 qw (pacotes de 2 e 1 qw); nos bons tem ~40 `ref`/`cnt`/`call`/`ret`. O percurso das tags está certo; o jogo é que monta a cadeia vazia.
+
+O que os dados mostram (`PS2X_ORDER_TRACE=<gatilho>` imprime por kick de VIF1 as tags DMA, pacotes, janelas e conclusões):
+- Por frame há dois pares: (A, VIF1 grande, ~2790 XGKICKs, 15 janelas `MSKPATH3(0) NOP MSKPATH3(1)`) e (B, VIF1 pequeno, ~125 XGKICKs, 4 janelas).
+- Na introdução A tem 14 pacotes (~1500 uploads) e B 3; o alocador percorre o pool inteiro 11616..16351 em anel, alternando metades por lote.
+- Na jogabilidade B continua com 3 pacotes (35 uploads, incluindo o atlas do HUD CT16 256×128 em 11616), mas os três lotes de B caem todos em 11616..12447 e se sobrescrevem; A fica vazia na maioria dos frames. Os draws do mundo usam TBP 11904..12416 (dentro dessa faixa: lixo) e 12544..14208 (fora: corretos).
+- O dump do PCSX2 da mesma fase tem ~700 uploads por frame, em anel por 11616..16255, intercalados com os draws: lá a jogabilidade se comporta como a nossa introdução.
+
+Hipótese de trabalho: no runtime o anel de texturas do jogo fica restrito a 11616..12447 depois da transição, como se o restante do pool continuasse "em uso". O candidato mais provável é a contabilidade que o jogo faz pelas entradas 0x42 da fila de DMA (decrementam um contador quando a fila chega nelas) e pelas interrupções de conclusão; falta localizar o alocador no código do jogo e ver qual contador não volta. Próximo passo: achar quem escreve o DBP dos BITBLTBUF de B (pacotes `cnt` de 2/4 qw) e vigiar as variáveis de limite do anel na transição (upd 2011..2031).
+
+Ferramentas novas desta investigação: `PS2X_ORDER_TRACE`, `ARM_AFTER`/`KEEP_CAPTURE`/`UNSET`/`PAD` em `path3_gate_test.py`, e os arquivos `gameplay-transfers.bin(.seq)`/`intro-transfers.bin.seq` em `recomp/diagnostics/path3-gate/`.
+
+### Corrupção na jogabilidade do Level_00 resolvida: estouro da lista de DMA do próprio jogo — 2026-10-08
+
+Causa (bug latente do jogo, não do runtime). A hipótese do anel de texturas acima estava errada: o jogo monta os uploads do mundo em todos os frames; quem some com eles é a própria lista.
+
+- Cada buffer de DMA do jogo (2 × 0x7F800 bytes, pré-alocados com 1 MiB em `func_002B4FB0`) guarda, de baixo para cima, a fila de entradas e a lista VIF1, e no topo a lista GIF dos uploads. No primeiro upload do frame o gerenciador de texturas (`D_00440280`, `func_00270B98`) reserva (62 + 512) × 24 qw ≈ 220 KiB para a lista GIF, então sobram ~290 KiB para a lista VIF1.
+- O alocador da lista (`func_002B3D88`) pede `a1 + 4` qw livres: os 4 são o terminador que o flush (`func_002B2E20`) grava. Só que vários renderizadores escrevem mais do que reservam (`func_001CDD98` pede 3 qw e grava 8; medido: até 80 bytes além da reserva).
+- Na jogabilidade a lista VIF1 do mundo enche o buffer em todo frame (o alocador falha, dá flush e troca de buffer no meio do frame). Quando o último a escrever foi um desses renderizadores, a lista termina a menos de 0x40 do topo e o terminador cai em cima dos primeiros qwords da lista GIF (`0x1d6de80`). A cadeia GIF do par passa a ser só `end` 3 qw (o próprio terminador da VIF1) e o frame inteiro é desenhado sem os uploads: lixo. Como o tamanho da lista varia alguns qwords de frame para frame, a imagem alternava.
+- Num PS2 o mesmo código faria o mesmo com a mesma lista; lá a lista não deve chegar a encher o buffer nesse ponto (ver "Pendente").
+
+Correção: `ps2recomp/overrides/black_dma_guard.cpp` soma 8 qw ao pedido de toda chamada a `func_002B3D88`, de modo que o alocador dá flush 8 qw mais cedo e o terminador nunca alcança a lista GIF. `BLACK_DMA_GUARD=0` desliga.
+
+Validação (mesmo roteiro, dump a cada 7 updates para pegar as duas paridades, média de brilho do frame):
+- sem a correção: `2038:28 2045:35 … 2101:43 2108:42 2115:42 2122:52 2129:52 2136:42 2143:42 2150:52 2157:42 2164:41`;
+- com a correção, duas execuções: `2038:49 2045:50 … 2157:52 2164:50 2171:50`, nenhum frame abaixo de 49. Quatro dumps consecutivos em `recomp/diagnostics/path3-gate/guard-four.png`.
+
+Como foi achado: `ps2recomp/overrides/black_texarena_trace.cpp` (diagnóstico, só com variável):
+- `BLACK_TEXARENA_TRACE=<arquivo>` (arma quando `<arquivo>.trigger` existe; `BLACK_TEXARENA_EVENTS=n`): loga reset/flip/upload/lista GIF do gerenciador de texturas e alloc/grow/flush/swap/pump/qadd do gerenciador de DMA, com ponteiros das listas, entrada corrente da fila, D1/D2 e GIF_STAT/VIF1_STAT no pump;
+- `BLACK_TEXARENA_WATCH=1` embrulha todas as funções e aponta quem deixa a lista VIF1 maior que a última reserva (`UNRESERVED-WRITERS`, `MAX-OVER`).
+- No runtime: `PS2X_ORDER_TRACE` agora imprime as tags DMA da cadeia GIF (`cnt2 ref330 … end0`), `B`/`N` (KiB e tags da cadeia VIF1) e `D` (kilo-ciclos até a VIF1 concluir); `PS2X_RAM_DUMP=<arquivo>` grava a RAM quando `<arquivo>.trigger` aparece; `PS2X_DMA_STRICT=1` (com `PS2X_DMA_COOPERATIVE=1`) tira a fatia grátis do VIF1. Nenhum deles muda o padrão.
+
+Também descartado nesta rodada, lendo o PCSX2 (`Gif_Unit.h`, `Gif.cpp`): a máscara do PATH3 só segura o pacote seguinte (estado IDLE/WAIT depois de um EOP), igual ao nosso gate; a granularidade mais fina que aparece no dump do PCSX2 (um upload, alguns draws, outro upload) vem do fatiamento por IMT ao longo do tempo, não de uma regra de máscara diferente.
+
+Pendente:
+- Por que a lista do mundo enche o buffer aqui: no dump do PCSX2 (outra câmera da mesma fase) há 2364 TEX0 e 143 texturas base por frame; no nosso spawn são ~4300 TEX0 e 318 (178 distintas, 101 das 105 do PCSX2 entre elas). Pode ser só a câmera, ou estamos desenhando mais do que o console (culling/LOD). Vale conferir porque também é custo de GPU.
+- Os vidros das janelas no spawn mostram um mosaico de blocos (reflexo/ambiente); não foi comparado com o console.
+
+### Renderer: paraLLEl-GS volta a ser o padrão do launcher — 2026-10-08
+
+Com as duas correções de ordem/conteúdo no lugar (gate do PATH3 e guarda da lista de DMA), o backend paraLLEl-GS que tinha sido arquivado por "cores erradas" passou a desenhar o Level_00 certo: `recomp/diagnostics/path3-gate/parallel-four.png` (quatro dumps seguidos na jogabilidade). Os erros de antes eram do stream, não dele.
+
+Medições no Level_00, sem hooks de debug, VU0/VU1 recompiladas, mesmo roteiro:
+
+| Renderer | updates/s na introdução e na jogabilidade | Thread do jogo |
+|---|---|---|
+| SDL_GPU (kernels próprios) | 4,7–4,9 | 93% ocupada: 32% montando lotes (`TryMetal`/`submit`), ~23% VU, 9% uploads/CLUT |
+| paraLLEl-GS (MoltenVK) | 8,8–9,1 (3,5 min estáveis, sem erros) | 22% esperando a GPU (`vkWaitSemaphores` em `flush_submit`), ~31% VU, 7% entregando GIF, 5% em mutex |
+
+- Apresentação nativa (`PS2X_GS_NATIVE_PRESENT=1`) dá os mesmos 9,0: o readback do scanout não é o gargalo.
+- Os vidros das janelas no spawn saem com o reflexo liso no paraLLEl-GS e em mosaico no SDL_GPU: o mosaico é defeito do nosso kernel (filtro/mip), não do jogo.
+- `ps2recomp/JogarBlack.command` usa paraLLEl-GS quando `recomp/gpu/build/libblack-parallel-gs.so` e o MoltenVK existem; `BLACK_GS=sdlgpu` força o SDL_GPU. Sem o módulo, continua no SDL_GPU.
+- `ps2recomp/gpu/parallel_gs_module.cpp`: as variáveis de diagnóstico passaram a ser lidas uma vez (`ENV_ONCE`); eram ~8 `getenv` por pacote GIF (2% em `__findenv_locked` mais boa parte dos 5% em mutex). **Ainda não compilado**: o clone do paraLLEl-GS usado no build de 06/10 estava em `/tmp` e foi parcialmente apagado pelo sistema; o módulo em uso é o binário antigo. `ps2recomp/gpu/build.sh` refaz o clone (commit fixado) em `recomp/gpu/parallel-gs` e recompila.
+
+Para onde vai o tempo agora (frame de ~111 ms):
+- VU1 ~34 ms. O código gerado ainda simula o pipeline em tempo de execução: `commitReadyPipelines` 4,7%, `calculateFmacProductSticky` 3,7%, `normalizeFmacResult` 2,1%, `updateFmacFlags` 1,4% — cerca de 12% do frame só em flags/commits. O próximo passo do gerador é resolver a latência das flags estaticamente por bloco (saber em geração qual instrução está visível em cada leitura) em vez de enfileirar em tempo de execução.
+- Espera da GPU ~25 ms, dentro do flush do par pequeno (HUD) no `swap` do jogo.
+- Tudo isso roda na thread do jogo. A lógica do jogo em si (EE recompilado) é ~10–20% do frame; tirar VIF1/VU1/GS da thread do jogo (a cadeia já é copiada no kick) é o que separa 9 de ~20 updates/s.
+
+### paraLLEl-GS alimentado por uma thread própria — 2026-10-08
+
+`GSParallelBackend` (`include/runtime/gs/gs_parallel_backend.h`) deixou de chamar o módulo na thread do jogo. Pacotes GIF, escritas de registrador, uploads, clears e flushes são anexados a um fluxo de bytes (segmentos de 256 KiB, no máximo 48 MiB em fila) e reproduzidos em ordem por uma thread do adaptador. Tudo o que lê estado da GPU esvazia o fluxo antes: `Present` (o flip que escolheu o frame vem depois dos draws dele), `ConsumeLocalToHostBytes`, `ReadVram`/`WriteVram`/`SnapshotVram`, `Sync(Finish|Reset)` e `Reset`. `PS2X_GS_PARALLEL_THREAD=0` volta à alimentação síncrona.
+
+- Medido no Level_00 (introdução e jogabilidade): **9,0 → 14,0–14,4 updates/s**. A thread do jogo não espera mais a GPU (`__psynch_cvwait` 22% → 1%) nem o mutex disputado com o apresentador.
+- Imagem igual à do modo síncrono: mesma série de brilho e `recomp/diagnostics/path3-gate/parallel-mt-four.png`.
+- Perfil depois disso: VU1 é 51% da thread do jogo, sendo ~20% do frame só em flags/commits (`commitReadyPipelines` 7,2%, `calculateFmacProductSticky` 6,5%, `normalizeFmacResult` 3,7%, `updateFmacFlags` 3,0%); `processVIF1DataPrefix` 5,6%, `memmove` 5,6%, `advanceEeTimers` 4,3%.
+- VU1: `calculateFmacProductSticky` não roda mais quando ninguém pode observar o registrador de status (VU1 sem FSEQ/FSAND/FSOR na imagem carregada; nenhuma das 27 imagens do Level_00 tem; FSSET sozinho só escreve). `analyzeFastPairs` marca isso por unidade; a VU0 continua exata porque o EE lê as flags dela. Replay dos traces: 0 divergências em 2327 execuções/3,17 M pares da VU1 (máscara de status 0x3F, só flags correntes) e em 8000 execuções da VU0 (máscara completa). 14,0 → **14,4 updates/s**.
+- Estado no fim de 2026-10-08, Level_00: thread do jogo 99% ocupada, thread de alimentação do GS 14%, GPU folgada. Divisão da thread do jogo (frame de 69 ms): corpos recompilados da VU1 33%, `commitReadyPipelines` 9%, `runFast` 5%, flags 6%, código do jogo (EE recompilado) 9%, IOP 6%, `processVIF1DataPrefix` 6%, `memmove` 5%, `advanceEeTimers` 5%.
+- Próximo passo de maior retorno: tirar a cadeia VIF1 inteira (unpack + VU1 + envio ao GS) da thread do jogo. A cadeia já é copiada no kick; falta enfileirar na mesma ordem os kicks de GIF, as escritas diretas nos FIFOs e os registradores privilegiados do GS (o flip tem de ficar atrás dos draws), manter no lado do EE uma sombra de MSKPATH3/VIF1_STAT/GIF_STAT e esvaziar a fila antes de qualquer leitura de volta. Estimativa pelo perfil: thread do jogo ~21 ms, thread VIF1/VU1 ~43 ms por frame (~23 updates/s), e daí em diante o limite é o custo da VU1.
+
+### Cadeia VIF1 fora da thread do jogo (`PS2X_VIF1_THREAD=1`) — 2026-10-08
+
+Com a variável ligada (o launcher liga; `BLACK_VIF1_THREAD=0` desliga), a thread do EE deixa de consumir o snapshot da cadeia que ela mesma copia no kick. Cadeias GIF, cadeias VIF1, escritas no FIFO da VIF1, reset da VIF1 e os registradores de CRT entram numa fila e são reproduzidos em ordem por uma thread ("sink") que passa a ser dona de tudo o que vem depois: estado da VIF1, VU1, máscara do PATH3 e sua fila, árbitro GIF e front end do GS. Código em `ps2_memory.cpp` (bloco "DMA sink thread"), sem mudança de header.
+
+- O EE continua vendo o DMA concluir na hora, como no modelo síncrono. O que o jogo consulta e depende do que está na fila é mantido em sombra no lado do EE, percorrendo o stream VIF1 enfileirado com as mesmas regras de tamanho de comando do interpretador (`dmaSinkScanVif1`): máscara do PATH3 (GIF_STAT.M3P) e pacotes retidos atrás da máscara (GIF_STAT.FQC — sem isso o pump do jogo `func_002B2638` fica preso esperando FQC≠0 depois do kick do GIF).
+- Os registradores de CRT (PMODE, SMODE, DISPFB/DISPLAY, BGCOLOR) viajam na fila e a apresentação usa a cópia "ordenada" (`ps2xGsSetOrderedDisplayRegs` em `gs_frontend.cpp`): o flip que o jogo escreve depois de ver o DMA concluir não pode ser apresentado antes de a thread desenhar aquele frame.
+- O que não é snapshot de cadeia (transferências em modo normal, leitura de volta do GS) esvazia a fila e roda como antes. VIF0 fica na thread do jogo, sem esvaziar nada (estado próprio). Os callbacks de MSCAL/MSCNT não tocam o contexto do EE quando rodam na sink.
+- Os timers do EE passaram a receber o tempo em fatias de 2048 ciclos (`advanceEeTimers` acumulava a cada checkpoint de bloco, com busca em mapa); acesso a registrador de timer aplica o que está pendente antes.
+- Medido no spawn do Level_00 (visão mais pesada da fase), sem hooks: 14 → **20,5 updates/s**; em visões mais leves a fase chega a tempo real (30 updates/s por segundo de host, `g/t` ≈ 1,0). A máquina estava carregada por outra sessão compilando (load 10–40), então os números são conservadores.
+- Imagem no spawn igual à do modo síncrono: mesma série de brilho e `recomp/diagnostics/path3-gate/sink-spawn.png`.
+- Agora quem limita é a própria thread sink (100% ocupada): 81% VU1 — corpos recompilados 47%, `commitReadyPipelines` 8,6%, `runFast` 7,4%, `normalizeFmacResult` 4,9%, `updateFmacFlags` 3,6% — mais `processVIF1DataPrefix` 8,3% e `memmove` 8,5%. A thread do jogo fica ~50% ociosa esperando a fila.
+- Limitações conhecidas (por isso é variável, não padrão do runtime): acesso direto do EE à memória da VU1 e stubs HLE do GS que chamam o front end sem passar pela fila não esvaziam a sink; SIGNAL/FINISH chegam ao CSR no tempo da sink.
+
+Defeitos de imagem vistos nesta rodada que **não** são da sink (aparecem também no modo síncrono): a arma em primeira pessoa fica pequena no canto e em alguns frames vira espetos pretos (`sync-street.png`, quadro inferior direito); com a câmera virada para outras áreas aparecem leques de triângulos nos cantos do céu e chão verde liso (`sink-street.png`). Não investigados.
+
+Nota de ambiente: outra sessão (repositório `silent-hill-origins-recomp`) compila e roda um binário com o mesmo nome `ps2EntryRunner`; shells e execuções daqui que citavam esse nome morreram várias vezes junto com os builds de lá. `path3_gate_test.py` agora roda uma cópia chamada `blackRunner`.
+
+### VU1: imagens não recompiladas em jogo e gerador corrigido — 2026-10-08
+
+- Na sessão de jogo real do usuário o log mostrou **32 imagens de microcódigo VU1 (e 1 VU0) sem código recompilado**, rodando interpretadas (~5× mais lento por par). Os roteiros automáticos (introdução + spawn) não passam por elas, por isso as medições não mostravam.
+- O gerador (`ps2recomp/diagnostics/vu1_recompile.cpp`) tinha um `else` pendurado: o "emitir todos os pares" das imagens capturadas sem cobertura estava ligado ao `if` de dentro do laço, então essas imagens saíam com 0 pares (era o defeito "imagens de `vu-captured/` saem vazias"). Corrigido; com as 7 imagens já capturadas o arquivo gerado passou a 50 imagens / 35.023 pares / 5.045 corpos distintos. Dos 17.811 pares que escrevem flags FMAC, só 1.833 (10%) ainda precisam calculá-las.
+- O launcher agora exporta `PS2X_VU_RECOMP_CAPTURE=recomp/diagnostics/vu-captured`: toda imagem desconhecida vista em jogo é salva (uma vez) e `ps2recomp/build_vu_recompiled.sh` a inclui na próxima geração. Fluxo: jogar → rodar o script → jogar de novo sem interpretação.
+- Tentado e revertido: flags MAC "preguiçosas" (guardar o resultado bruto e derivar o MAC só na leitura). Correto nos traces (0 divergências fora do status), mas sem ganho: 14,1 ns/par no replay antes e depois, e no jogo o custo só trocou de função. O tempo de `commitReadyPipelines` vem de ser chamado a quase todo ciclo por causa de Q/stores/escritas atrasadas, não das flags.
+
+Recebido da sessão do Silent Hill Origins (mesmo runtime), não verificado aqui: no raster SDL_GPU a tabela de swizzle de Z16/Z16S usa páginas de 64×32, mas páginas de 16 bits são 64×64 (`gs_sdl_gpu_raster.cpp`, laço da LUT; `bitAddress()` em `gs_metal_shader.h`, casos 50 e 58). Só afeta jogos com Z de 16 bits e o caminho SDL_GPU; o padrão aqui é o paraLLEl-GS.
+
+### VU1 recompilada por microprograma, extraída do executável — 2026-10-08
+
+Substitui o fluxo "jogar para capturar imagens" na VU1.
+
+- Todo o microcódigo da VU1 está no `SLUS_213.76`, em comandos VIF MPG. `ps2recomp/diagnostics/extract_vu_programs.py ELF DIR [--verify imagens...]` segue as cadeias de MPG com endereços contíguos e grava cada programa em `recomp/diagnostics/vu-programs/prog1-<endereço>-<fnv>.bin`: **70 programas, 23.512 pares**. Conferido contra as 34 imagens capturadas com cobertura: os 22.774 PCs executados caem todos dentro de um programa inteiro extraído (o que sobra nas imagens é resto de programa antigo parcialmente sobrescrito, nunca executado).
+- As "imagens" de 16 KiB que o runtime identificava por hash são sobreposições desses programas na ordem em que o jogo os carrega (47 distintas nas capturas, 32 novas numa única sessão de jogo). Não dá para enumerar offline, então o runtime deixou de depender delas: quando o código da VU muda, `vuMatchPrograms` (em `ps2_vu1_core.cpp`) confere quais programas da tabela gerada estão inteiros no endereço de carga e monta, por par de instruções, qual função recompilada é dona dele; `runFast` despacha por PC. A busca por imagem inteira continua (VU0 e imagens capturadas).
+- O gerador (`vu1_recompile.cpp`) aceita arquivos `prog<unidade>-<endereço>-<id>.bin`: compila o programa inteiro (sem alcançabilidade) dentro de uma imagem sintética cujo entorno só lê flags MAC, para que um resultado que possa sair do programa com flags pendentes continue calculando-as. Emite `VuRecompiled::programs()` e define `PS2X_VU_RECOMPILED_PROGRAMS`.
+- `build_vu_recompiled.sh` agora extrai os programas do executável e gera a partir deles mais as imagens da VU0. Arquivo gerado: 70 programas + 3 imagens VU0, 19.988 pares, 4,4 MB (antes 5,5 MB com 50 imagens).
+- Validação: replay dos traces com 0 divergências (VU1 2327 execuções/3,17 M pares; VU0 8000 execuções), 9,0 ns/par (igual ao caminho por imagem). Na introdução sem pular, que antes mostrava 14 imagens "not recompiled", agora nenhuma.
+- Para gerar o arquivo pela primeira vez sem esperar a compilação do antigo: um `black_vu1_recompiled.inc` stub (só `find` devolvendo `nullptr`) basta para compilar o gerador.
+- Fica valendo a captura do launcher (`vu-captured/`) só para código que não venha do executável; não se espera nenhum na VU1.
+
+### Módulo paraLLEl-GS recompilado e IOP recompilado estaticamente — 2026-10-08
+
+**paraLLEl-GS.** `ps2recomp/gpu/build.sh` refez o clone (commit fixado, agora em `recomp/gpu/parallel-gs`) e recompilou o módulo com a troca dos `getenv` por leitura única. O jogo roda igual; no spawn a taxa ficou em ~21,6 updates/s (o gargalo é a thread da VU1, então o ganho não aparece ali).
+
+**IOP.** Os módulos IRX deixaram de ser interpretados:
+- `iop_cpu_exec.inl`: o corpo do executor virou `IopCpuCore::executeDecoded(cpu, palavra)`, compartilhado pelo interpretador (que busca a palavra) e pelo código gerado (que passa um literal, e o decode some na compilação).
+- O carregador informa o tamanho do texto (`IopImageLoadResult::textSize`, do cabeçalho IOPMOD). Com `PS2X_IOP_RECOMP_CAPTURE=<dir>` o runner grava o texto já relocado de cada módulo (`iop-<base>-<fnv>.bin`); o launcher aponta para `recomp/diagnostics/iop-captured`. Os 10 módulos do Black carregam nos primeiros segundos do boot.
+- `ps2recomp/diagnostics/iop_recompile.py` gera `ps2xIOP/src/emulator/black_iop_recompiled.inc` (local, nunca versionar): uma função por bloco básico (10 módulos, 6.279 blocos, 30.865 instruções) e uma tabela por módulo com a função que começa em cada palavra. `ps2recomp/build_iop_recompiled.sh` gera e recompila.
+- No runtime (`iop_emulator.cpp`): ao carregar um módulo, se base, tamanho e hash do texto batem, a tabela é registrada; `runCpu` despacha o PC para o bloco. Cada instrução do bloco chama `stepRecompiled`, que mantém tudo o que `step`/`runCpu` fazem (condições do laço, interrupção, DMA, callbacks, contadores) e confere se a palavra na memória ainda é a compilada; se não for, aquela instrução volta ao interpretador. Stubs de import continuam resolvidos pelo interpretador. `PS2X_IOP_RECOMPILED=0` desliga.
+- Verificação: é equivalente por construção (mesmo corpo de instrução, mesma sequência de passos); no jogo, com ligado e desligado o roteiro de pad chega ao Level_00 igual e nenhum módulo fica sem código ("has no recompiled code" não aparece). Não há teste diferencial instrução a instrução.
+- Custo: **não ficou mais rápido**. Blocos recompilados 5,1% do tempo ocupado da thread do jogo contra ~5–6% do caminho interpretado (`executeInstruction` + `decode` + `step`). A primeira versão, com uma função por 8 KiB de texto, ficou 3× mais lenta (funções de 2048 instruções em que o jogo entra e sai a cada poucas instruções) e foi trocada pelos blocos. O custo do IOP nunca foi executar instruções: é o escalonador rodando a cada quantum com o IOP quase sempre ocioso.
+- Por isso o launcher passou a usar `PS2X_IOP_QUANTUM=512` (padrão do runtime: 128 ciclos de IOP): o IOP cai de 19,8% para 13,3% do tempo ocupado da thread do jogo (2048 dá 12,0%). 512 ciclos são ~14 µs de tempo do console.
+
+Com isso não resta código do console interpretado no caminho normal: EE, VU0, VU1 e IOP são recompilados; os interpretadores ficam como referência e para código que não bate com o gerado.
+
+### FPU do EE: `sqrt.s` lia o operando errado (e mais três desvios) — 2026-10-08
+
+Erros do tradutor de FPU do recompilador (`ps2xRecomp/src/lib/fpu_translator.cpp`), todos no código do jogo já recompilado:
+
+- **`SQRT.S`**: no EE a codificação é `SQRT.S fd, ft` (operando no campo ft; fs é zero). O tradutor emitia `sqrt(f[fs])`, isto é, sempre `sqrt(f0)`. Das 200 `sqrt.s` do Black, 147 tinham ft≠0 e calculavam o valor errado (ex.: `0x46020084` = `sqrt.s f2,f2` virava `f2 = sqrt(f0)`). O desassemblador nem reconhece a instrução (`c1 0x…`), por isso passou despercebido.
+- **`RSQRT.S`**: emitia `1/sqrt(f[fs])`; o EE calcula `fs / sqrt(ft)` (1 ocorrência no jogo).
+- **`DIV.S` por zero**: dava infinito; no EE dá ±FLT_MAX (sinal de fs xor ft) — o EE não tem infinito nem NaN (1075 divisões).
+- **`CVT.W.S`**: usava `nearbyintf` (arredonda); no EE sempre trunca e satura (455 ocorrências).
+- Também: `SQRT`/`RSQRT` usam o módulo do operando. Macros novas em `ps2_runtime_macros.h` (`FPU_DIV_S(ctx,a,b)`, `FPU_RSQRT_S`, `ps2FpuCvtW`). Exige regerar o código do jogo (`ps2recomp/build.sh`).
+
+Efeito no Level_00 (mesmo roteiro):
+- O jogador passa a nascer **dentro da sala**, com mesa e cadeira à frente e a arma grande à direita — a mesma pose do dump do PCSX2 de 06/10 (`~/Library/Application Support/PCSX2/snaps/…111320.png`). Antes nascia do lado de fora, colado na parede das janelas, com a arma minúscula no canto: posição, câmera e arma estavam erradas por causa das raízes.
+- Os "espetos pretos" da arma somem com o `CVT.W.S` truncando (conferido isolando cada correção).
+- A fase roda a **30 updates/s** no spawn e nas visões testadas (antes ~21 no spawn errado), com a máquina carregada.
+- Quadro: `recomp/diagnostics/path3-gate/fpufix-spawn.png`.
+
+**Ainda errado nessa visão:** a casca do prédio (paredes de tijolo, teto, janelas) que aparece no PCSX2 não é desenhada; vê-se o cenário externo e o céu atrás da mesa. É igual com a VU de referência (`PS2X_VU_RECOMPILED=0`), então não vem da VU1 recompilada; fica para investigar no lado do EE (visibilidade/setores) ou no stream.
+
+Conferido e sem problema: os códigos de função COP1 usados pelo jogo (0x00–0x07, 0x16, 0x18, 0x1C, 0x1E, 0x24, 0x28, 0x29, 0x32, 0x34, 0x36 e CVT.S.W) estão todos tratados; `VRSQRT` da VU0 ignora o numerador, mas as 394 ocorrências usam `vf0w` (=1).

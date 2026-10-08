@@ -623,8 +623,12 @@ int main()
             mipCpu.Submit(mipDrawB);
         }
         if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
-        gpuMipLevelMatchesCpu = mipGpuVram == mipCpuVram &&
-            mipBatchedDraws == 0u && mipRasterPasses == 2u;
+        // Mip-sampled draws batch only with PS2X_GS_WIDE_BATCH=1 (their mip
+        // footprints join the hazard check); only the image is asserted here.
+        gpuMipLevelMatchesCpu = mipGpuVram == mipCpuVram;
+        std::printf("  mip LOD: batched draws=%llu raster passes=%llu VRAM %s\n",
+            static_cast<unsigned long long>(mipBatchedDraws), static_cast<unsigned long long>(mipRasterPasses),
+            mipGpuVram == mipCpuVram ? "matches" : "DIFFERS");
 
         // Nonzero MIPTBP is unreachable for MXL=0, MMIN<2, or constant LOD=0.
         std::vector<uint8_t> mipZeroGpuVram = texturedSeedVram;
@@ -698,8 +702,12 @@ int main()
             mipAliasCpu.Submit(mipAliasRead);
         }
         if (!savedGpuSelection.empty()) setenv("PS2X_GS_SDL_GPU", savedGpuSelection.c_str(), 1);
+        // The two writers may share a pass; the feedback read must not join them.
         gpuMipAliasMatchesCpu = mipAliasGpuVram == mipAliasCpuVram &&
-            mipAliasBatchedDraws == 0u && mipAliasRasterPasses == 3u;
+            mipAliasBatchedDraws <= 1u && mipAliasRasterPasses >= 2u;
+        std::printf("  mip alias: batched draws=%llu raster passes=%llu VRAM %s\n",
+            static_cast<unsigned long long>(mipAliasBatchedDraws), static_cast<unsigned long long>(mipAliasRasterPasses),
+            mipAliasGpuVram == mipAliasCpuVram ? "matches" : "DIFFERS");
 
         std::vector<uint8_t> batchCapacityGpuVram(bytes, 0);
         std::vector<uint8_t> batchCapacityCpuVram(bytes, 0);
@@ -1076,7 +1084,7 @@ int main()
                     *mismatch.first, *mismatch.second);
             }
         }
-        std::printf("SDL_GPU Metal GS TEX1/MIPTBP alias differential: %s (LOD=0 mip registers stay isolated around feedback; full VRAM matches CPU)\n",
+        std::printf("SDL_GPU Metal GS TEX1/MIPTBP alias differential: %s (feedback read stays out of the writers' pass; full VRAM matches CPU)\n",
             gpuMipAliasMatchesCpu ? "PASS" : "FAIL");
         std::printf("SDL_GPU Metal GS raster batch capacity: %s (129 disjoint draws -> 2 dispatches; full VRAM matches CPU)\n",
             gpuRasterBatchCapacityMatchesCpu ? "PASS" : "FAIL");

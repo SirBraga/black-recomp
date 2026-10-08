@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <string>
 #include <vulkan/vulkan_metal.h>
+// The diagnostics switches are read once: getenv takes the environment lock and these sit on the per-packet path.
+#define ENV_ONCE(name) ([]{static const char* const value=std::getenv(name);return value;}())
 
 #if defined(__APPLE__)
 extern "C" void* black_metal_presenter_create(void*,VkDevice,VkQueue,PFN_vkExportMetalObjectsEXT);
@@ -57,7 +59,7 @@ struct Host {
  ~Host(){if(capture)std::fclose(capture);}
 
  void snapshot_if_requested(const char* stage="scanout", int triggerContext=-1, uint32_t packetPrefix=0) {
-  const char* request=std::getenv("PS2X_PARALLEL_SNAPSHOT_REQUEST");
+  const char* request=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_REQUEST");
   if(!request||snapshotTaken)return;
   FILE* trigger=std::fopen(request,"rb");if(!trigger)return;std::fclose(trigger);
   const uint32_t clutInstance=gs.debug_clut_instance();
@@ -100,18 +102,18 @@ struct Host {
  void remember(uint32_t kind,uint32_t path,const uint8_t* data,uint32_t size) {
   currentEventCaptured=false;
   if(!automaticSnapshotArmed&&!snapshotTaken){
-   const char* after=std::getenv("PS2X_PARALLEL_SNAPSHOT_AFTER_READBACKS");
-   const char* request=std::getenv("PS2X_PARALLEL_SNAPSHOT_REQUEST");
+   const char* after=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_AFTER_READBACKS");
+   const char* request=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_REQUEST");
    if(after&&request&&readbacks>=std::strtoull(after,nullptr,0)){
     if(FILE* trigger=std::fopen(request,"wb")){std::fclose(trigger);automaticSnapshotArmed=true;}
    }
   }
-  if(const char* filename=std::getenv("PS2X_PARALLEL_STREAM_CAPTURE")){
-   const char* start=std::getenv("PS2X_PARALLEL_CAPTURE_AFTER_READBACKS");
+  if(const char* filename=ENV_ONCE("PS2X_PARALLEL_STREAM_CAPTURE")){
+   const char* start=ENV_ONCE("PS2X_PARALLEL_CAPTURE_AFTER_READBACKS");
    const uint64_t delay=start?std::strtoull(start,nullptr,0):0;
    if(readbacks>=delay && !captureFull){
    if(!capture && !capturedBytes)capture=std::fopen(filename,"wb");
-   const char* limitEnv=std::getenv("PS2X_PARALLEL_CAPTURE_MAX_MB");
+   const char* limitEnv=ENV_ONCE("PS2X_PARALLEL_CAPTURE_MAX_MB");
    const uint64_t limit=uint64_t(limitEnv?std::clamp(std::strtoul(limitEnv,nullptr,0),16ul,1024ul):128ul)*1024*1024;
    if(capture && capturedBytes+12+size<=limit){
     uint32_t header[3]={kind,path,size};
@@ -120,13 +122,13 @@ struct Host {
    }else if(capture){captureFull=true;std::fprintf(stderr,"[parallel-gs] stream capture full; stopping at a contiguous event boundary\n");}
    }
   }
-  if(!std::getenv("PS2X_PARALLEL_BAD_TRANSFER_CAPTURE"))return;
+  if(!ENV_ONCE("PS2X_PARALLEL_BAD_TRANSFER_CAPTURE"))return;
   if(size==0||size>1024*1024)return;
   recent.push_back({kind,path,std::vector<uint8_t>(data,data+size)});
   if(recent.size()>32)recent.pop_front();
  }
  void audit(const ParallelGS::RegisterState* observed=nullptr) {
-  const char* filename=std::getenv("PS2X_PARALLEL_BAD_TRANSFER_CAPTURE");
+  const char* filename=ENV_ONCE("PS2X_PARALLEL_BAD_TRANSFER_CAPTURE");
   if(!filename||badTransferDumped)return;
   const auto& r=observed?*observed:gs.get_register_state();
   if(r.trxdir.desc.XDIR!=1)return;
@@ -185,7 +187,7 @@ static void reset(void* p){host(p).remember(6,0,nullptr,0);host(p).gs.flush();ho
 static void gif(void* p,uint32_t path,const uint8_t* data,uint32_t size){
  auto& h=host(p);h.remember(1,path,data,size);
  // Inspect A+D transport without fragmenting the renderer's optimized packet handler.
- if(std::getenv("PS2X_PARALLEL_BAD_TRANSFER_CAPTURE")&&!h.badTransferDumped){
+ if(ENV_ONCE("PS2X_PARALLEL_BAD_TRANSFER_CAPTURE")&&!h.badTransferDumped){
   auto state=h.gs.get_register_state();auto parser=h.gs.get_gif_path(path);
   for(uint32_t offset=0;offset+16<=size;offset+=16){
    if(parser.loop>=parser.tag.NLOOP){std::memcpy(&parser.tag,data+offset,16);parser.loop=0;parser.reg=0;continue;}
@@ -203,8 +205,8 @@ static void gif(void* p,uint32_t path,const uint8_t* data,uint32_t size){
  }
  // Optional one-shot capture at the first changed indexed TEX0 with CLD.
  // Only split packets while an explicit trigger exists; normal rendering stays batched.
- if(std::getenv("PS2X_PARALLEL_SNAPSHOT_ON_TEX0")&&!h.snapshotTaken){
-  const char* request=std::getenv("PS2X_PARALLEL_SNAPSHOT_REQUEST");
+ if(ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_ON_TEX0")&&!h.snapshotTaken){
+  const char* request=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_REQUEST");
   FILE* trigger=request?std::fopen(request,"rb"):nullptr;
   if(trigger){
    std::fclose(trigger);
@@ -217,8 +219,8 @@ static void gif(void* p,uint32_t path,const uint8_t* data,uint32_t size){
     for(unsigned c=0;c<2;c++){
      const uint64_t tex=after.ctx[c].tex0.bits;
      const unsigned psm=(tex>>20)&63;
-     const char* filter=std::getenv("PS2X_PARALLEL_SNAPSHOT_PSM");
-     const char* exactTex0=std::getenv("PS2X_PARALLEL_SNAPSHOT_TEX0");
+     const char* filter=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_PSM");
+     const char* exactTex0=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_TEX0");
      if((!filter||psm==std::strtoul(filter,nullptr,0))&&
         (!exactTex0||tex==std::strtoull(exactTex0,nullptr,0))&&
         tex!=oldTex[c]&&((tex>>61)&7)!=0&&(psm==19||psm==20||psm==27||psm==36||psm==44)){
@@ -321,7 +323,7 @@ static int scanout(void* p,GSParallelScanout* req){
   for(uint32_t x=0;x<w;++x)dst[x*4u+3u]=255u;
  }
  req->width=w;req->height=ht;
- if(!std::getenv("PS2X_PARALLEL_SNAPSHOT_ON_TEX0"))h.snapshot_if_requested();
+ if(!ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_ON_TEX0"))h.snapshot_if_requested();
  return 1;
 }
 extern "C" const GSParallelAPI* black_parallel_gs_api(){static const GSParallelAPI api{5,create,destroy,reset,gif,reg,image,flush,wait,read,write,fifo,clear,scanout,attachWindow};return &api;}

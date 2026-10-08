@@ -50,3 +50,13 @@ register_functions.cpp
 ps2_recompiled_*.h
 black_vu_aot_generated.hpp
 *.toml
+# código gerado a partir do jogo (microcódigo da VU, módulos do IOP) e o que é extraído dele
+black_vu1_recompiled.inc
+black_iop_recompiled.inc
+vu0_macro_ops*.inc
+vu-programs/
+vu-captured/
+vu-trace/
+vu-coverage-*/
+iop-captured/
+prog[01]-*

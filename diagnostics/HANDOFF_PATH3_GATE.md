@@ -95,3 +95,7 @@ ao runner e não zera o STATUS com `STATUS_APPEND=1`. O report `[path3-gate]` sa
 tamanho real da fila (antes imprimia sempre `fifo=0`). Patch 0001 regenerado. Números em
 `ps2recomp/PS2_PROJECT_STATE.md`, seção de 2026-10-07. Pendente: `PS2Recomp-local-changes.patch` (README) e
 desempenho na fase (~0,8 upd/s nos dois modos).
+
+## Jogabilidade — 2026-10-08
+
+A corrupção que restava depois da introdução não era do PATH3: era a lista de DMA do próprio jogo estourando sobre a lista de uploads. Corrigido por `ps2recomp/overrides/black_dma_guard.cpp`; detalhes em `ps2recomp/PS2_PROJECT_STATE.md`, seção "Corrupção na jogabilidade do Level_00 resolvida".
