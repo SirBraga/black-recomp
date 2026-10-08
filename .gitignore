@@ -40,6 +40,8 @@ bios/
 *.rdram.bin
 # capturas/dumps de diagnóstico e imagens extraídas do jogo
 *.png
+!docs/
+!docs/*.png
 *.ppm
 *.raw
 *.dump

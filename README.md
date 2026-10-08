@@ -1,5 +1,9 @@
 # black-recomp
 
+![Gameplay no Level_00](docs/gameplay.png)
+
+Level_00 rodando nativo no Mac (após o fix do vf0).
+
 ## O que é
 
 Isso aqui é uma tentativa de rodar o **Black** (PS2, EA/Criterion) nativo no Mac, sem emulador.
