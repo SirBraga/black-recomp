@@ -1,8 +1,8 @@
 # black-recomp
 
-![Gameplay no Level_00](docs/gameplay.png)
+![Gameplay em Veblensk](docs/gameplay.png)
 
-Level_00 rodando nativo no Mac (após o fix do vf0).
+Veblensk rodando nativo no Mac.
 
 ## O que é
 
