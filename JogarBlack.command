@@ -3,7 +3,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNNER="$ROOT/tools/PS2Recomp/out/rt/ps2xRuntime/ps2EntryRunner"
 DISC="$ROOT/recomp/disc"
-export BLACK_CD_IMAGE="$ROOT/orig/Black.iso"
+# Text language. The translated strings live in the loose files of recomp/disc (tools/loc/install.sh), which the game
+# reads when no disc image is given; the image has the original English. BLACK_LANG=en plays from the image.
+if [[ "${BLACK_LANG:-ptbr}" == "en" ]]; then
+    export BLACK_CD_IMAGE="$ROOT/orig/Black.iso"
+else
+    export BLACK_CD_IMAGE=""
+fi
 # GS renderer: paraLLEl-GS (Vulkan compute over MoltenVK) when its module is built, about twice as fast as
 # the in-tree SDL_GPU kernels in Level_00; BLACK_GS=sdlgpu forces the SDL_GPU/Metal renderer.
 GS_MODULE="$ROOT/recomp/gpu/build/libblack-parallel-gs.so"
@@ -37,6 +43,12 @@ export PS2X_IOP_RECOMP_CAPTURE="${PS2X_IOP_RECOMP_CAPTURE:-$ROOT/recomp/diagnost
 # IOP scheduling quantum in IOP cycles (runtime default 128): 512 is ~14 us of guest time and cuts the
 # scheduler overhead of an IOP that is idle most of the time.
 export PS2X_IOP_QUANTUM="${PS2X_IOP_QUANTUM:-512}"
+# BLACK_IOP_THREAD=1 (experimental): the IOP (sound, disc, pad) on its own thread instead of inside the game thread.
+if [[ "${BLACK_IOP_THREAD:-}" == "1" ]]; then export PS2X_IOP_THREAD=1; else unset PS2X_IOP_THREAD; fi
+# Slow stretches are written down (and which threads were busy) in recomp/diagnostics/hitches.log, at no cost:
+# BLACK_FPS=1 prints every 2 s window to the terminal instead, BLACK_FPS=0 turns it off.
+mkdir -p "$ROOT/recomp/diagnostics"
+if [[ "${BLACK_FPS:-hitch}" == "0" ]]; then unset BLACK_FPS; else export BLACK_FPS="${BLACK_FPS:-hitch}"; fi
 export BLACK_CUTSCENE_SKIP="${BLACK_CUTSCENE_SKIP:-1}"
 # If the game jumps to a bad address (it freezes there), keep the RAM and the last calls for diagnosis.
 export PS2X_FAULT_RAM_DUMP="${PS2X_FAULT_RAM_DUMP:-$ROOT/recomp/diagnostics/fault.ram}"
@@ -57,5 +69,8 @@ cd "$DISC"
 if [[ "${BLACK_WATCH:-}" == "1" ]]; then
     export BLACK_WATCH_RAM="$ROOT/recomp/diagnostics/watch-fault.ram"
     exec lldb -b -o "command script import $ROOT/ps2recomp/diagnostics/watch_bucket.py" -o run -- "$RUNNER" "$DISC/SLUS_213.76"
+fi
+if [[ "${BLACK_FPS:-}" == "hitch" ]]; then
+    exec "$RUNNER" "$DISC/SLUS_213.76" 2> >(tee >(grep --line-buffered "black-fps" >> "$ROOT/recomp/diagnostics/hitches.log") >&2)
 fi
 exec "$RUNNER" "$DISC/SLUS_213.76"

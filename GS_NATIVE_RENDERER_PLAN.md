@@ -160,3 +160,55 @@ Com o teleporte funcionando de fato (e o PCSX2 rodando ao fundo, o que piora os 
 1. GS: cachear estado ligado por lote (textura, sampler, uniforms, depth state) e especializar o pipeline; cópia de envio por bloco inteiro.
 2. VU1: dividir os lotes entre núcleos (estudo de independência ainda por fazer) ou reduzir o custo por par abaixo dos 2,2 ns.
 3. Thread do jogo: chamadas diretas na EE, IOP em thread própria.
+
+### Quinta rodada (2026-10-10)
+
+- **Tela de título em 16:9:** a "régua" nas laterais é do próprio menu (o paraLLEl-GS mostra igual). Dump `titlew`: nativo a no máximo 0,08% da referência. Não é defeito.
+- **Envios:** blocos cobertos por bitmap (sem ordenar a cada envio) e hash por CRC32C de hardware. Replay do ponto pesado: ~6,5 ms por scanout.
+- **Medição mais confiável:** `perf_run.py` aperta R1 várias vezes para sair do tutorial; antes algumas execuções ficavam paradas na pausa e davam números de cena leve.
+- **Onde estão as quedas agora** (ponto pesado, 60 ticks, 2×, com o PCSX2 aberto ao fundo): mediana 59,9, p10 43,6, mínimo 35,5. Ocupação: thread do jogo 97%, VU1 88%, GS 68%. **O limite é a thread do jogo**: 52,6% código do jogo, 15,1% IOP, 9,9% runtime, 8,2% VU0, 6,2% cópias, 4,9% despacho. Aumentar o quantum do IOP (512 → 2048) não muda a fatia dele: é trabalho real (mixagem do SPU2, kernel), não escalonamento.
+- **Próximo passo de desempenho: IOP em thread própria.** A interface é estreita (`runEeCycles`, `deliverSifCommand`, `onSifTransfer`, acesso à memória do IOP; de volta, `IopHost`: `readGuest/writeGuest`, `sendSifCommand`, `invokeGuestFunction`, áudio, arquivos, pad). Plano: uma thread dona do IOP que consome ciclos acumulados pela EE; um mutex serializa as entradas vindas da EE; `sendSifCommand` e `invokeGuestFunction` passam a ser enfileirados para a thread da EE. Risco: ordem de eventos SIF e streaming de áudio/disco; precisa de teste longo.
+
+### Sexta rodada (2026-10-10): IOP em thread própria e validação de texturas
+
+- **IOP em thread própria** (`PS2X_IOP_THREAD=1`, `BLACK_IOP_THREAD=1` no launcher; experimental, desligado por padrão). Implementado em `ps2_runtime.cpp`: a EE só acumula ciclos; uma thread os transforma em tempo de IOP; um mutex recursivo serializa todas as entradas no IOP e uma entrada feita pela EE primeiro põe o IOP em dia; comandos SIF enviados pelo IOP a partir da thread dele entram numa fila que a EE entrega no ponto onde antes rodava o IOP; atraso máximo de ~2 ms de tempo de EE. Medido no ponto pesado: fatia do IOP na thread do jogo 11,7% → 1,4%, thread nova ~11% ocupada, sem falhas em duas execuções de 135 s. **Falta validar som e streaming de disco de ouvido e em sessão longa.**
+- **Validação de texturas sem custo por consulta:** cada bloco da VRAM tem a lista das texturas decodificadas que o leem; um envio que muda o bloco ou um alvo que desenha nele marca essas entradas. A consulta virou um teste de duas flags; as listas de blocos de cada textura (e de cada nível de mipmap) são calculadas uma vez. `closeBatch` caiu de ~16% para ~2% da thread no replay; ponto pesado 6,75 → 5,87 ms por scanout, imagens idênticas.
+- **Medição em jogo continua contaminada:** o PCSX2 do usuário segue aberto a 174% de velocidade e disputa os núcleos de desempenho. Na última execução a thread do jogo ficou 54% do tempo esperando, com VU1 em 99% e GS em 93%: o limite passa a ser VU1/GS quando o jogo anda. Refazer com o PCSX2 fechado antes de decidir o próximo alvo (VU1 em vários núcleos ou mais cortes no GS).
+
+### Medição limpa (2026-10-10, PCSX2 fechado)
+
+**O perfilador `sample` derruba o jogo enquanto roda** (30–47 atualizações/s durante a amostragem e ~85 logo depois, recuperando). Os p10/mínimos de 28–50 e as ocupações de 97–99% anotados nas rodadas anteriores vinham dessa janela e não valem como taxa. `perf_run.py` aceita `SAMPLE=0` (sem perfilador) e o contador (`BLACK_FPS=1`) imprime por janela de 2 s o pior intervalo entre atualizações e quantos passaram de 20 e 25 ms. O roteiro também aperta X, para sair dos tutoriais.
+
+Ponto pesado, 60 ticks, 2×, apresentação direta, 90 s sem perfilador:
+
+| | média | pior intervalo | > 20 ms | > 25 ms |
+|---|---|---|---|---|
+| IOP na thread do jogo | 59,94 | 40,8 ms | 220 | 11 |
+| IOP em thread própria | 59,94 | 20,8 ms | 1 | 0 |
+
+O jogador fica parado no ponto; falta medir em movimento/combate e validar o som com o IOP em thread própria antes de torná-lo padrão.
+
+### Engasgos de um quadro (2026-10-10, fim do dia)
+
+- **Relógio de vblank sem "dívida"** (`EeScheduler.cpp`): quando um vblank chega mais de meio período atrasado, o tempo perdido é descartado; antes os vblanks seguintes vinham colados e o jogo passava de 60 (83–87) depois de cada trecho lento. `PS2X_VBLANK_CATCHUP=1` volta ao comportamento antigo.
+- **Registro de engasgos sem perfilador:** o contador imprime por janela de 2 s o pior intervalo, quantos passaram de 20/25 ms e a ocupação por thread segundo o kernel (threads nomeadas: `GameThread`, `VIF1/VU1`, `GS`, `IOP`). O launcher grava as janelas ruins em `recomp/diagnostics/hitches.log` (`BLACK_FPS=hitch`, padrão; `1` imprime tudo; `0` desliga).
+- **Na pose do savestate do PCSX2** (`POSE=recomp/diagnostics/pcsx2/state01.eeMemory.bin`, 80 s, 2×, IOP em thread própria): média 59,9, mas 14 intervalos acima de 25 ms (todos de ~30–34 ms, um quadro perdido), com as threads longe do limite (VU1 ≤ 62%, jogo ≤ 54%, GS ≤ 53%). Ou seja: não é falta de fôlego, é um quadro isolado que passa de 16,6 ms e perde o vblank. Falta medir quanto cada etapa leva por quadro (jogo, VU1, GS) para achar de quem é o pico; candidatos: decodificação de texturas novas, espera pela fila do GS, leitura de disco, espera pelo IOP.
+- O roteiro apertava R1 muitas vezes e o recuo levantava a mira para o céu (cena mais leve que a pretendida); agora aperta só duas.
+- **Relatos do usuário ainda em aberto:** sem som com o IOP em thread própria (não mexer agora); pistola atira mais rápido que a animação a 60 ticks (o patch de 60 fps do PCSX2 dobra a velocidade do jogo, então não serve de comparação); lentidão logo depois de sair da porta da sala inicial.
+
+### VU1: para onde vai o tempo e estudo de independência entre lotes (2026-10-10)
+
+Thread VIF1/VU1 no ponto pesado (perfil): microprogramas ~68% (um programa, `prog1_4e3a409a54ef7013`, 36%), cópias de memória ~11%, varredura de cada pacote GIF 7% (removida: `scanGpuGifHostEffects` agora pula pacotes sem A+D e listas de registradores inteiros), resto ~14%. No trace: 2,29 ns por par, 95,6% em blocos diretos.
+
+**Como o Black usa a VU1:** é um programa longo que para ao fim de cada lote e é continuado por `MSCNT`. Num trace contíguo de 6.000 execuções (`recomp/diagnostics/vu-trace/contig.bin`, `PS2X_VU_TRACE_STRIDE=1`), 5.960 são continuações e só 40 são `MSCAL` (entrada em 0). Os lotes se distinguem pelo PC onde continuam: `0x1758` (4.038 dos 6.000, geometria), `0x2858` (580), `0x16c8` (574), `0x2618` (415) e outros.
+
+**Medição** (`ps2x_vu1_trace_replay <trace> --engine recompiled --independence K`): cada lote é executado como gravado e de novo a partir do estado que teria se os K lotes anteriores não tivessem acontecido (o que ele herdou sem mudança volta ao valor de antes deles; o que o VIF escreveu no meio fica).
+
+| K (lotes anteriores ignorados) | mesmos pacotes (lotes / pares) | mesmos pacotes e mesmas escritas próprias |
+|---|---|---|
+| 1 | 95,0% / 90,8% | 4,4% / 5,6% |
+| 2 | 33,6% / 29,2% | 3,5% / 3,1% |
+| 4 | 14,0% / 10,8% | 1,0% / 0,6% |
+| 8 | 13,4% / 9,9% | 0,8% / 0,5% |
+
+Leitura: a saída de um lote quase nunca depende do lote imediatamente anterior, mas depende de algo de 2 ou mais lotes atrás (o lote de preparação do objeto: matrizes, luzes), e quase todo lote deixa registradores e memória diferentes do que deixaria sozinho (ponteiros de buffer alternados, temporários). Não há lotes simplesmente independentes para distribuir: dividir entre núcleos exige execução especulativa (lote N+1 começa do estado anterior ao lote N, com os dados do VIF aplicados) e validação pelo conjunto do que o lote N escreveu contra o que o N+1 lê antes de escrever, que teria de vir da análise estática dos microprogramas. Ganho possível: perto de 1,7× na parte de geometria com dois núcleos. É um projeto de vários dias, com risco, e a VU1 hoje não é o limite a 60 (58–67% de um núcleo); passa a ser para 120 Hz.

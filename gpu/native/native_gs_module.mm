@@ -531,15 +531,23 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 std::fprintf(stderr, "[upload] %zu blocks changed from %u\n", blocks.size(), unsigned(blocks.front()));
             ++vramGeneration;
             std::bitset<kPages> pages;
+            uint32_t firstPage = kPages, lastPage = 0;
             for (const uint16_t block : blocks)
             {
                 ++blockGeneration[block];
+                for (TextureEntry *user : blockUsers[block])
+                    user->valid = false;
                 pages.set(block >> 5);
+                firstPage = std::min<uint32_t>(firstPage, block >> 5);
+                lastPage = std::max<uint32_t>(lastPage, block >> 5);
             }
             for (auto &entry : targets)
             {
                 Target &target = entry.second;
-                for (uint32_t page = 0, count = target.pageCount(); page < count; ++page)
+                const uint32_t count = target.pageCount();
+                if (firstPage >= target.fbp + count || lastPage < target.fbp)
+                    continue;
+                for (uint32_t page = std::max(firstPage, target.fbp) - target.fbp; page < count && target.fbp + page <= lastPage; ++page)
                     if (pages.test(target.fbp + page))
                         target.stale.set(page);
             }
@@ -826,9 +834,10 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
         {
             id<MTLTexture> texture = nil;
             std::vector<uint16_t> pages;
-            uint64_t checkedGeneration = 0, pageSum = 0, hash = 0;
-            uint64_t dirtyEpoch = ~0ull; // gpuDirtyEpoch when the blocks were last checked against the targets
-            bool drawnOver = false;
+            uint64_t hash = 0;
+            bool valid = false, drawnOver = false, registered = false;
+            std::vector<uint16_t> mipBlocks; // blocks of the levels below the base, level after level
+            uint32_t mipStart[9] = {};
         };
 
         struct Batch
@@ -878,7 +887,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
         uint64_t blockGeneration[kVramBytes / 256u] = {};
         std::bitset<kVramBytes / 256u> gpuDirtyBlocks; // union of every target's gpuDirty
         uint64_t syncReason = 0;
-        uint64_t gpuDirtyEpoch = 0;           // bumped whenever a block becomes dirty
+        std::vector<TextureEntry *> blockUsers[kVramBytes / 256u]; // decoded textures that read each block
         uint64_t readbacks = 0;
         uint16_t blockOwner[kVramBytes / 256u] = {}; // base of the last upload that covered the block, plus one
         uint64_t vramGeneration = 1;
@@ -1196,73 +1205,91 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 key = (key ^ (uint64_t(levels[level].tbp) | (uint64_t(levels[level].tbw) << 14) | (uint64_t(level) << 20))) * 0x100000001b3ull;
             levels[0] = {tbp, tbw, width, height};
             TextureEntry &entry = textures[key];
-            // Not while a target has drawn over this texture's memory since: that has to come back to VRAM first.
-            if (entry.dirtyEpoch != gpuDirtyEpoch)
-            {
-                entry.dirtyEpoch = gpuDirtyEpoch;
-                entry.drawnOver = false;
-                for (const uint16_t block : entry.pages)
-                    entry.drawnOver = entry.drawnOver || gpuDirtyBlocks.test(block);
-            }
-            const bool drawnOver = entry.drawnOver;
-            if (entry.texture && !drawnOver && entry.checkedGeneration == vramGeneration)
+            // Valid until a transfer changes one of its blocks or a target draws over one: both are told to the entry
+            // through the per-block user lists, so this test costs nothing per lookup.
+            if (entry.texture && entry.valid && !entry.drawnOver)
                 return entry.texture;
-            if (entry.texture && !drawnOver && generationSum(entry.pages) == entry.pageSum)
+            if (entry.drawnOver || !entry.registered)
             {
-                entry.checkedGeneration = vramGeneration;
-                return entry.texture;
-            }
-
-            if (gpuDirtyBlocks.any())
-            {
+                // What a target drew over this texture's memory has to come back to VRAM first.
                 std::bitset<kVramBytes / 256u> needed;
-                if (paletted)
-                    for (uint32_t block = cbp; block < cbp + (psm == 0x13u || psm == 0x1Bu ? 4u : 1u) && block < kVramBytes / 256u; ++block)
+                if (entry.registered)
+                    for (const uint16_t block : entry.pages)
                         needed.set(block);
-                const gsn::Swizzle &where = gsn::Swizzle::of(psm);
-                for (uint32_t level = 0; level < levelCount; ++level)
-                    for (uint32_t y = 0; y < levels[level].height; y += 8u)
-                        for (uint32_t x = 0; x < levels[level].width; x += 8u)
-                            needed.set(where.bitAddress(levels[level].tbp, levels[level].tbw, x, y) >> 11);
+                else
+                {
+                    if (paletted)
+                        for (uint32_t block = cbp; block < cbp + (psm == 0x13u || psm == 0x1Bu ? 4u : 1u) && block < kVramBytes / 256u; ++block)
+                            needed.set(block);
+                    const gsn::Swizzle &where = gsn::Swizzle::of(psm);
+                    for (uint32_t level = 0; level < levelCount; ++level)
+                        for (uint32_t y = 0; y < levels[level].height; y += 8u)
+                            for (uint32_t x = 0; x < levels[level].width; x += 8u)
+                                needed.set(where.bitAddress(levels[level].tbp, levels[level].tbw, x, y) >> 11);
+                }
                 syncReason = tex0;
                 syncFromGpu(needed);
                 entry.drawnOver = false;
-                entry.dirtyEpoch = gpuDirtyEpoch;
+                if (entry.texture && entry.valid)
+                    return entry.texture;
             }
             const uint32_t ta0 = uint32_t(texa) & 0xFFu, ta1 = uint32_t(texa >> 32) & 0xFFu;
             const bool aem = ((texa >> 15) & 1u) != 0u;
-            GSMem::TexturePageCache cache;
-            std::bitset<kVramBytes / 256u> used;
             uint32_t palette[256];
             uint64_t paletteHash = 0xcbf29ce484222325ull;
+            const gsn::Swizzle &layout = gsn::Swizzle::of(psm);
             if (paletted)
             {
+                const gsn::Swizzle &clut = gsn::Swizzle::of(cpsm);
                 const uint32_t entries = psm == 0x13u || psm == 0x1Bu ? 256u : 16u;
                 for (uint32_t i = 0; i < entries; ++i)
                 {
                     // CSM1 layout: 16x16 with the middle index bits swapped, or 8x2.
                     const uint32_t at = entries == 256u ? (i & 0xE7u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1) : i;
                     const uint32_t x = entries == 256u ? at & 15u : at & 7u, y = entries == 256u ? at >> 4 : at >> 3;
-                    palette[i] = expand(GSMem::ReadTexture(cache, vram.data(), cpsm, cbp, 1u, x, y), cpsm, ta0, ta1, aem);
+                    palette[i] = expand(clut.read(vram.data(), cbp, 1u, x, y), cpsm, ta0, ta1, aem);
                     paletteHash = (paletteHash ^ palette[i]) * 0x100000001b3ull;
-                    if ((x & 7u) == 0u && (y & 7u) == 0u)
-                        used.set(((GSMem::PixelBitAddress(cpsm, cbp, 1u, x, y) >> 3) & (kVramBytes - 1u)) >> 8);
                 }
             }
-            for (uint32_t level = 0; level < levelCount; ++level)
-                for (uint32_t y = 0; y < levels[level].height; y += 8u)
-                    for (uint32_t x = 0; x < levels[level].width; x += 8u)
-                        used.set(gsn::Swizzle::of(psm).bitAddress(levels[level].tbp, levels[level].tbw, x, y) >> 11);
-            entry.pages.clear();
-            for (uint32_t block = 0; block < kVramBytes / 256u; ++block)
-                if (used.test(block))
+            if (!entry.registered)
+            {
+                // The key fixes the address, format and size, so the blocks of an entry never change: listed once,
+                // level by level (the first level also carries the palette's blocks).
+                std::bitset<kVramBytes / 256u> used;
+                if (paletted)
                 {
-                    entry.pages.push_back(uint16_t(block));
+                    const gsn::Swizzle &clut = gsn::Swizzle::of(cpsm);
+                    for (uint32_t y = 0; y < (psm == 0x13u || psm == 0x1Bu ? 16u : 2u); y += 8u)
+                        for (uint32_t x = 0; x < (psm == 0x13u || psm == 0x1Bu ? 16u : 8u); x += 8u)
+                            used.set(clut.bitAddress(cbp, 1u, x, y) >> 11);
                 }
-            entry.pageSum = generationSum(entry.pages);
-            entry.checkedGeneration = vramGeneration;
+                std::bitset<kVramBytes / 256u> all = used;
+                entry.pages.clear();
+                entry.mipBlocks.clear();
+                for (uint32_t level = 0; level < levelCount; ++level)
+                {
+                    std::bitset<kVramBytes / 256u> mine;
+                    for (uint32_t y = 0; y < levels[level].height; y += 8u)
+                        for (uint32_t x = 0; x < levels[level].width; x += 8u)
+                            mine.set(layout.bitAddress(levels[level].tbp, levels[level].tbw, x, y) >> 11);
+                    all |= mine;
+                    entry.mipStart[level] = uint32_t(entry.mipBlocks.size());
+                    if (level != 0u)
+                        for (uint32_t block = 0; block < kVramBytes / 256u; ++block)
+                            if (mine.test(block))
+                                entry.mipBlocks.push_back(uint16_t(block));
+                }
+                entry.mipStart[levelCount] = uint32_t(entry.mipBlocks.size());
+                for (uint32_t block = 0; block < kVramBytes / 256u; ++block)
+                    if (all.test(block))
+                    {
+                        entry.pages.push_back(uint16_t(block));
+                        blockUsers[block].push_back(&entry);
+                    }
+                entry.registered = true;
+            }
+            entry.valid = true;
 
-            const gsn::Swizzle &layout = gsn::Swizzle::of(psm);
             // The same bytes as an earlier upload, in the same format: the texture decoded then.
             const auto record = uploads.find(tbp);
             bool known = record != uploads.end() && generationSum(record->second.blocks) == record->second.blockSum;
@@ -1271,17 +1298,16 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             else if (!known)
                 ++unknownChanged;
             const bool knownBase = known;
-            // With mip levels the upload has to account for every block the texture reads (levels sent under the same base).
             // Mip levels may have been sent on their own: each one is identified by the upload that covers it.
             uint64_t mipHash = 0;
             for (uint32_t level = 1; level < levelCount && known; ++level)
             {
-                const uint32_t owner = blockOwner[layout.bitAddress(levels[level].tbp, levels[level].tbw, 0u, 0u) >> 11];
+                const uint32_t first = entry.mipStart[level], last = entry.mipStart[level + 1u];
+                const uint32_t owner = first != last ? blockOwner[entry.mipBlocks[first]] : 0u;
                 const auto from = owner != 0u ? uploads.find(owner - 1u) : uploads.end();
                 known = from != uploads.end() && generationSum(from->second.blocks) == from->second.blockSum;
-                for (uint32_t y = 0; y < levels[level].height && known; y += 8u)
-                    for (uint32_t x = 0; x < levels[level].width && known; x += 8u)
-                        known = blockOwner[layout.bitAddress(levels[level].tbp, levels[level].tbw, x, y) >> 11] == owner;
+                for (uint32_t i = first; i < last && known; ++i)
+                    known = blockOwner[entry.mipBlocks[i]] == owner;
                 if (known)
                     mipHash = (mipHash ^ from->second.hash ^ uint64_t(levels[level].tbp - (owner - 1u))) * 0x100000001b3ull;
             }
@@ -1492,17 +1518,16 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 return;
             target.markedRect = rect;
             const gsn::Swizzle &layout = gsn::Swizzle::of(target.psm);
-            bool fresh = false;
             for (uint32_t y = y0 & ~7u; y < y1; y += 8u)
                 for (uint32_t x = x0 & ~7u; x < x1; x += 8u)
                 {
                     const uint32_t block = layout.bitAddress(target.fbp * 32u, target.fbw, x, y) >> 11;
-                    fresh = fresh || !gpuDirtyBlocks.test(block);
+                    if (!gpuDirtyBlocks.test(block))
+                        for (TextureEntry *user : blockUsers[block])
+                            user->drawnOver = true;
                     target.gpuDirty.set(block);
                     gpuDirtyBlocks.set(block);
                 }
-            if (fresh)
-                ++gpuDirtyEpoch;
         }
 
         // The game also draws things it later reads as plain memory (palettes drawn with triangles, hidden in the unused
@@ -1566,7 +1591,11 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 // Decoded textures and palettes over these blocks are out of date; the targets themselves are not.
                 ++vramGeneration;
                 for (const uint16_t block : changed)
+                {
                     ++blockGeneration[block];
+                    for (TextureEntry *user : blockUsers[block])
+                        user->valid = false;
+                }
             }
         }
 

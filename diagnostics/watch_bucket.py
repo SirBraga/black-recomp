@@ -8,7 +8,10 @@ function names carry the guest addresses) and the registers go to the log and th
 """
 import lldb, os
 
-WATCH_GUEST = 0x4C9C00  # [D_0040F4C0] + 0x14 + 0xCA58 + 0x14
+# BLACK_WATCH_ADDR=<guest address> watches something else; BLACK_WATCH_ARM=<symbol> arms it when that function is
+# first called (any recompiled function works: its first argument is the guest RAM). BLACK_WATCH_HITS=<n> keeps the
+# watchpoint for n writes instead of one.
+WATCH_GUEST = int(os.environ.get('BLACK_WATCH_ADDR', '0x4C9C00'), 0)  # default: [D_0040F4C0] + 0x14 + 0xCA58 + 0x14
 state = {}
 
 def setup(frame, location, internal):
@@ -36,11 +39,13 @@ def hit(frame, watch, internal):
     if error.Success():
         open(path, 'wb').write(data)
         print('[watch]   guest RAM saved to ' + path, flush=True)
-    watch.SetEnabled(False)
+    state['hits'] = state.get('hits', 0) + 1
+    if state['hits'] >= int(os.environ.get('BLACK_WATCH_HITS', '1')):
+        watch.SetEnabled(False)
     return False
 
 def __lldb_init_module(debugger, internal):
     target = debugger.GetSelectedTarget()
-    breakpoint = target.BreakpointCreateByName('sub_001AF580_0x1af580')
+    breakpoint = target.BreakpointCreateByName(os.environ.get('BLACK_WATCH_ARM', 'sub_001AF580_0x1af580'))
     breakpoint.SetScriptCallbackFunction('watch_bucket.setup')
     print('[watch] waiting for the bucket table to be set up (level load)', flush=True)

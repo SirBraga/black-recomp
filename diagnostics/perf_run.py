@@ -13,12 +13,21 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[2]
 out = root / 'recomp/diagnostics/perf'; out.mkdir(parents=True, exist_ok=True)
 tag = sys.argv[1] if len(sys.argv) > 1 else 'run'
+# Performance is measured at the position of the PCSX2 savestate (the street of Level_00, a lot in view) unless
+# POSE says otherwise; POSE=none starts where the script leaves the player.
+default_pose = root / 'recomp/diagnostics/pcsx2/state01.eeMemory.bin'
+if 'POSE' not in os.environ and default_pose.exists():
+    os.environ['POSE'] = str(default_pose)
+if os.environ.get('POSE') == 'none':
+    del os.environ['POSE']
 runner = root / 'tools/PS2Recomp/out/rt/ps2xRuntime/ps2EntryRunner'
 alias = runner.with_name('blackPerf'); shutil.copy2(runner, alias)
 disc = root / 'recomp/disc'
-pad = '9:up:0.3,9.5:cross:0.3,20:select:0.3,22:cross:0.3,24:cross:0.3,26:cross:0.3,30:select:0.3,40:select:0.3,46:cross:0.3,48:cross:0.3,50:cross:0.3,54:select:0.3,62:cross:0.3,64:cross:0.3,68:select:0.3,80:select:0.3,88:r1:0.3,94:r1:0.3,100:r1:0.3'
+pad = '9:up:0.3,9.5:cross:0.3,20:select:0.3,22:cross:0.3,24:cross:0.3,26:cross:0.3,30:select:0.3,40:select:0.3,46:cross:0.3,48:cross:0.3,50:cross:0.3,54:select:0.3,62:cross:0.3,64:cross:0.3,68:select:0.3,80:select:0.3,88:r1:0.3,91:r1:0.3,94:r1:0.3,102:cross:0.3,106:cross:0.3,110:cross:0.3,114:cross:0.3,118:cross:0.3,122:cross:0.3,126:cross:0.3'
 env = {k: v for k, v in os.environ.items() if not k.startswith(('PS2X_', 'BLACK_'))}
-env.update({'BLACK_CD_IMAGE': str(root / 'orig/Black.iso'), 'BLACK_CUTSCENE_SKIP': '1', 'BLACK_FPS': '1',
+# The game runs with the Brazilian Portuguese text (loose files of recomp/disc; an empty BLACK_CD_IMAGE selects
+# them), as the launcher does. BLACK_LANG=en uses the disc image with the original English.
+env.update({'BLACK_CD_IMAGE': str(root / 'orig/Black.iso') if os.environ.get('BLACK_LANG') == 'en' else '', 'BLACK_CUTSCENE_SKIP': '1', 'BLACK_FPS': '1',
             'PS2X_PAD_SCRIPT': pad, 'PS2X_VIF1_THREAD': '1', 'PS2X_IOP_QUANTUM': '512',
             'PS2X_GS_PARALLEL': '1', 'PS2X_GS_PARALLEL_MODULE': str(root / 'recomp/gpu/build/libblack-parallel-gs.so'),
             'PS2X_GS_MOLTENVK': str(root / 'recomp/gpu/moltenvk/libMoltenVK.dylib')})
@@ -42,10 +51,13 @@ try:
         time.sleep(max(0, int(os.environ.get('WARMUP', '100')) - 78))
     else:
         time.sleep(int(os.environ.get('WARMUP', '100')))
+    # SAMPLE=0 skips the profiler: `sample` slows the game a lot while it runs (updates/s falls to 30-45 and then
+    # overshoots while the game catches up), so rates and hitch counts must come from runs, or windows, without it.
     sample = out / f'{tag}.sample.txt'
-    subprocess.run(['sample', str(child.pid), os.environ.get('SAMPLE', '8'), '-file', str(sample)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(3)
+    if os.environ.get('SAMPLE', '8') != '0':
+        subprocess.run(['sample', str(child.pid), os.environ.get('SAMPLE', '8'), '-file', str(sample)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3)
 finally:
     try: os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError: pass
@@ -54,5 +66,7 @@ finally:
 fps = [l.strip() for l in open(log, errors='replace') if 'black-fps' in l]
 print('updates/s (last 8 readings):', ' '.join(l.split('=')[-1] for l in fps[-8:]))
 here = Path(__file__).resolve().parent
+if os.environ.get('SAMPLE', '8') == '0':
+    sys.exit(0)
 subprocess.run([sys.executable, str(here / 'sample_threads.py'), str(sample), '6'])
 subprocess.run([sys.executable, str(here / 'sample_waits.py'), str(sample)])

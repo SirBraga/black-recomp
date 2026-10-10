@@ -41,6 +41,7 @@ if [[ "${1:-}" != "--skip-recomp" ]]; then
     # caminhos relativos a raiz do repo
     sed -i '' -e "s#^input = .*#input = \"orig/SLUS_213.76\"#" -e "s#^output = .*#output = \"recomp/output/\"#" "$CFG"
     python3 "$ROOT/ps2recomp/find_code_pointers.py" "$ELF" --toml "$CFG"
+    python3 "$ROOT/ps2recomp/add_instruction_patches.py" "$CFG"
     rm -rf "$OUT"
     "$P2R/out/build/ps2xRecomp/ps2_recomp" "$CFG" >"$ROOT/recomp/recomp.log" 2>&1
     grep -A12 "PS2Recomp report" "$ROOT/recomp/recomp.log" || true

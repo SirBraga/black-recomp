@@ -5,6 +5,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 
 #include <algorithm>
+#include <arm_acle.h>
 #include <bitset>
 #include <cstdint>
 #include <cstdio>
@@ -348,14 +349,20 @@ namespace gsn
                 transferActive = false;
                 return;
             }
-            uint64_t hash = transferHash;
-            for (size_t i = 0; i + 8u <= pendingTransfer.size(); i += 8u)
+            // Two interleaved CRC32C lanes (hardware instruction): megabytes of texture data go through this every frame.
+            uint32_t lane0 = uint32_t(transferHash), lane1 = uint32_t(transferHash >> 32);
+            size_t at = 0;
+            for (; at + 16u <= pendingTransfer.size(); at += 16u)
             {
-                uint64_t word;
-                std::memcpy(&word, pendingTransfer.data() + i, 8);
-                hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
-                hash ^= hash >> 32;
+                uint64_t first, second;
+                std::memcpy(&first, pendingTransfer.data() + at, 8);
+                std::memcpy(&second, pendingTransfer.data() + at + 8u, 8);
+                lane0 = __builtin_arm_crc32cd(lane0, first);
+                lane1 = __builtin_arm_crc32cd(lane1, second);
             }
+            for (; at < pendingTransfer.size(); ++at)
+                lane0 = __builtin_arm_crc32cb(lane0, pendingTransfer[at]);
+            const uint64_t hash = (uint64_t(lane1) << 32 | lane0) ^ (uint64_t(pendingTransfer.size()) * 0x9E3779B97F4A7C15ull);
             const uint32_t dbp = uint32_t(regs.bitbltbuf >> 32) & 0x3FFFu;
             const bool atOrigin = ((regs.trxpos >> 32) & 0x7FFu) == 0u && ((regs.trxpos >> 48) & 0x7FFu) == 0u;
             if (pendingTransfer.size() == transferExpected && sink->uploadUnchanged(dbp, atOrigin, hash, transferRectKey()))
@@ -392,8 +399,7 @@ namespace gsn
                     cellY = y >> 3;
                     cellChanged = false;
                     block = layout.bitAddress(dbp, dbw, x, y) >> 11;
-                    if (coveredBlocks.empty() || coveredBlocks.back() != block)
-                        coveredBlocks.push_back(uint16_t(block));
+                    coveredWords[block >> 6] |= 1ull << (block & 63u);
                 }
                 if (layout.write(vram, dbp, dbw, x, y, value) && !cellChanged)
                 {
@@ -444,8 +450,12 @@ namespace gsn
                 copyCells<uint8_t>(layout, data, bytes, dbp, dbw, dx, dy, width, height, changed);
             if (!changed.empty())
                 sink->vramWritten(changed);
-            std::sort(coveredBlocks.begin(), coveredBlocks.end());
-            coveredBlocks.erase(std::unique(coveredBlocks.begin(), coveredBlocks.end()), coveredBlocks.end());
+            // Sorted and unique straight from the bitmap (the pixel order visits blocks out of order and many times).
+            coveredBlocks.clear();
+            for (uint32_t word = 0; word < 256u; ++word)
+                for (uint64_t bits = coveredWords[word]; bits != 0u; bits &= bits - 1u)
+                    coveredBlocks.push_back(uint16_t(word * 64u + uint32_t(__builtin_ctzll(bits))));
+            std::memset(coveredWords, 0, sizeof(coveredWords));
             sink->uploadFinished(dbp, dx == 0u && dy == 0u, transferHash, transferRectKey(), coveredBlocks);
             coveredBlocks.clear();
         }
@@ -465,6 +475,7 @@ namespace gsn
         size_t transferExpected = 0;
         uint64_t transferHash = 0;
         std::vector<uint16_t> coveredBlocks, changedBlocks;
+        uint64_t coveredWords[256] = {};
         uint32_t transferX = 0, transferY = 0, carried = 0;
         uint8_t carry[3] = {};
 
@@ -481,8 +492,7 @@ namespace gsn
                 const uint32_t *offsets = layout.cell(x, y);
                 const uint32_t first = layout.bitAddress(dbp, dbw, x, y), base = first - offsets[0];
                 const uint16_t block = uint16_t(first >> 11);
-                if (coveredBlocks.empty() || coveredBlocks.back() != block)
-                    coveredBlocks.push_back(block);
+                coveredWords[block >> 6] |= 1ull << (block & 63u);
                 bool different = false;
                 for (uint32_t i = 0; i < count; ++i)
                 {

@@ -227,6 +227,7 @@ int main(int argc, char **argv)
     const char *exportDir = nullptr;
     const char *rebaselinePath = nullptr;
     int benchEngine = -1; // --bench-engine reference|fast
+    int independence = 0; // --independence K: see below
     VU1Interpreter::Engine candidate = VU1Interpreter::Engine::Fast; // --engine fast|recompiled
     size_t limit = 0;
     uint32_t statusMask = 0xC3Fu;
@@ -238,6 +239,7 @@ int main(int argc, char **argv)
         else if (!std::strcmp(argv[i], "--export") && i + 1 < argc) exportDir = argv[++i];
         else if (!std::strcmp(argv[i], "--rebaseline") && i + 1 < argc) rebaselinePath = argv[++i];
         else if (!std::strcmp(argv[i], "--limit") && i + 1 < argc) limit = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--independence") && i + 1 < argc) independence = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--status-mask") && i + 1 < argc) statusMask = std::strtoul(argv[++i], nullptr, 16);
     }
     std::vector<Record> records;
@@ -256,6 +258,107 @@ int main(int argc, char **argv)
         references[unit]->reset(); candidates[unit]->reset();
         references[unit]->setEngine(VU1Interpreter::Engine::Reference);
         candidates[unit]->setEngine(candidate);
+    }
+
+    // --independence K (the trace must be contiguous, PS2X_VU_TRACE_STRIDE=1): how much does a VU1 run depend on
+    // the K runs before it? Each run is executed twice, once as recorded and once from the state it would have had
+    // if those K runs had not happened: every register and data byte it inherited unchanged from the previous run
+    // is put back to its value before them, while what was written in between from outside (VIF unpacks) stays.
+    // A run whose packets are the same either way could have started before those runs finished; if what it writes
+    // (registers, data memory) is the same too, nothing downstream could tell. This is the measurement behind the
+    // question of spreading VU1 runs over several cores.
+    if (independence > 0)
+    {
+        VU1Interpreter &vu = *candidates[1];
+        const size_t distance = static_cast<size_t>(independence);
+        uint64_t totalPairs = 0, outputPairs = 0, fullPairs = 0;
+        size_t total = 0, outputSame = 0, fullSame = 0, shown = 0;
+        size_t byRegisters = 0, byMemory = 0, byFlags = 0;
+        std::map<uint32_t, std::pair<size_t, size_t>> byEntry; // PC where the run starts or continues -> runs, dependent runs
+        Result real, alone;
+        for (size_t n = distance; n < records.size(); ++n)
+        {
+            const Record &r = records[n], &previous = records[n - 1], &base = records[n - distance];
+            // Black's VU1 work is one long program that stops after each batch and is continued (MSCNT) for the next:
+            // nearly every record is such a continuation, and those are the batches of interest. The PC where a run
+            // continues is taken as known (it is where the previous one stopped).
+            bool usable = r.unit == 1u;
+            for (size_t k = n - distance; k < n && usable; ++k)
+                usable = records[k].unit == 1u;
+            if (!usable)
+                continue;
+            Record counterfactual = r;
+            {
+                const uint32_t *now = reinterpret_cast<const uint32_t *>(&r.before), *inherited = reinterpret_cast<const uint32_t *>(&previous.after),
+                               *before = reinterpret_cast<const uint32_t *>(&base.before);
+                uint32_t *target = reinterpret_cast<uint32_t *>(&counterfactual.before);
+                // vf, vi, acc, q, p, i, r: the registers a program computes with; then MAC, clip and status flags.
+                const size_t registerWords = offsetof(VU1State, pc) / 4u;
+                for (size_t w = 0; w < registerWords; ++w)
+                    if (now[w] == inherited[w])
+                        target[w] = before[w];
+                if (r.before.mac == previous.after.mac) counterfactual.before.mac = base.before.mac;
+                if (r.before.clip == previous.after.clip) counterfactual.before.clip = base.before.clip;
+                if (r.before.status == previous.after.status) counterfactual.before.status = base.before.status;
+                for (size_t b = 0; b < r.dataBefore.size() && b < previous.dataAfter.size(); ++b)
+                    if (r.dataBefore[b] == previous.dataAfter[b])
+                        counterfactual.dataBefore[b] = base.dataBefore[b];
+            }
+            runRecord(vu, r, real);
+            runRecord(vu, counterfactual, alone);
+            ++total;
+            totalPairs += real.pairs;
+            auto &entry = byEntry[r.resumed ? r.before.pc : r.startPC];
+            ++entry.first;
+            const bool sameOutput = real.packets.list == alone.packets.list;
+            // What the run itself wrote has to come out the same; what it only passed through does not count.
+            bool sameRegisters = true, sameFlags = true, sameMemory = true;
+            {
+                const uint32_t *a = reinterpret_cast<const uint32_t *>(&real.state), *b = reinterpret_cast<const uint32_t *>(&alone.state);
+                const uint32_t *ia = reinterpret_cast<const uint32_t *>(&r.before), *ib = reinterpret_cast<const uint32_t *>(&counterfactual.before);
+                for (size_t w = 0; w < offsetof(VU1State, pc) / 4u; ++w)
+                    if ((a[w] != ia[w] || b[w] != ib[w]) && a[w] != b[w])
+                        sameRegisters = false;
+                const uint32_t mask = statusMask;
+                if ((real.state.mac != r.before.mac || alone.state.mac != counterfactual.before.mac) && real.state.mac != alone.state.mac) sameFlags = false;
+                if ((real.state.clip != r.before.clip || alone.state.clip != counterfactual.before.clip) && real.state.clip != alone.state.clip) sameFlags = false;
+                if (((real.state.status ^ alone.state.status) & mask) != 0u && ((real.state.status ^ r.before.status) & mask) != 0u) sameFlags = false;
+                for (size_t i = 0; i < real.data.size(); ++i)
+                    if ((real.data[i] != r.dataBefore[i] || alone.data[i] != counterfactual.dataBefore[i]) && real.data[i] != alone.data[i])
+                    {
+                        sameMemory = false;
+                        break;
+                    }
+            }
+            if (sameOutput)
+            {
+                ++outputSame;
+                outputPairs += real.pairs;
+            }
+            else
+                ++entry.second;
+            if (sameOutput && sameRegisters && sameFlags && sameMemory)
+            {
+                ++fullSame;
+                fullPairs += real.pairs;
+            }
+            else if (sameOutput)
+            {
+                byRegisters += sameRegisters ? 0u : 1u;
+                byFlags += sameFlags ? 0u : 1u;
+                byMemory += sameMemory ? 0u : 1u;
+            }
+            if (!sameOutput && shown++ < 8)
+                std::printf("run %zu (pc=0x%x, %llu pairs, %zu packets): output depends on the previous %zu run(s)\n", n, r.startPC,
+                            static_cast<unsigned long long>(real.pairs), real.packets.list.size(), distance);
+        }
+        std::printf("independence from the previous %zu run(s), %zu runs, %llu pairs:\n", distance, total, static_cast<unsigned long long>(totalPairs));
+        std::printf("  same packets:                    %6.2f%% of the runs, %6.2f%% of the pairs\n", 100.0 * outputSame / std::max<size_t>(total, 1), 100.0 * outputPairs / std::max<uint64_t>(totalPairs, 1));
+        std::printf("  same packets and same own writes: %6.2f%% of the runs, %6.2f%% of the pairs\n", 100.0 * fullSame / std::max<size_t>(total, 1), 100.0 * fullPairs / std::max<uint64_t>(totalPairs, 1));
+        std::printf("  same packets but different writes: registers %zu, flags %zu, data memory %zu runs\n", byRegisters, byFlags, byMemory);
+        for (const auto &entry : byEntry)
+            std::printf("  entry 0x%04x: %zu runs, %zu with dependent output\n", entry.first, entry.second.first, entry.second.second);
+        return 0;
     }
 
     // --export DIR: write every image of the trace as DIR/vu1-<fnv>.bin plus
