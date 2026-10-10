@@ -10,6 +10,9 @@
 #   recomp/diagnostics/vu-captured/          PS2X_VU_RECOMP_CAPTURE=<this dir> (unknown images seen in game)
 #   recomp/diagnostics/vu-programs/          microprograms extracted from the executable (extract_vu_programs.py)
 set -euo pipefail
+# Black's EE code never reads VU0's flag registers (see ps2recomp/overrides/black_vu0_flags.cpp): the VU0
+# code is generated, and validated, with its flags on demand. The runner sets the same thing at start-up.
+export PS2X_VU0_FLAGS_UNOBSERVED=1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/tools/PS2Recomp/out/rt/ps2xRuntime"
 OUT="$ROOT/tools/PS2Recomp/ps2xRuntime/src/lib/vu/black_vu1_recompiled.inc"

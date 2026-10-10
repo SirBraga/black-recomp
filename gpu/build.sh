@@ -51,5 +51,5 @@ fi
 cmake -S "$ROOT/ps2recomp/gpu" -B "$OUT" -G Ninja \
  -DCMAKE_MAKE_PROGRAM="$ROOT/.venv/bin/ninja" -DCMAKE_BUILD_TYPE=Release \
  -DGS_SOURCE="$SOURCE" -DRUNTIME_INCLUDE="$ROOT/tools/PS2Recomp/ps2xRuntime/include"
-"$ROOT/.venv/bin/ninja" -C "$OUT" -j6 black-parallel-gs black-parallel-module-test black-parallel-texture-test
+"$ROOT/.venv/bin/ninja" -C "$OUT" -j6 black-parallel-gs black-parallel-module-test black-parallel-texture-test gs-replay black-native-gs
 printf 'GPU module: %s/libblack-parallel-gs.so\n' "$OUT"

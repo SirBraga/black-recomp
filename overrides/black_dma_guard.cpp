@@ -15,7 +15,7 @@
 namespace
 {
     constexpr uint32_t kDmaListAlloc = 0x002B3D88u;
-    constexpr uint32_t kDmaGuardQwords = 8u;
+    uint32_t kDmaGuardQwords = 8u; // BLACK_DMA_GUARD_QW=<n> overrides (diagnostic)
     PS2Runtime::RecompiledFunction g_dmaListAlloc = nullptr;
 
     void dmaListAllocThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -35,6 +35,8 @@ namespace
         const char *value = std::getenv("BLACK_DMA_GUARD");
         if (value && value[0] == '0')
             return;
+        if (const char *qw = std::getenv("BLACK_DMA_GUARD_QW"))
+            kDmaGuardQwords = static_cast<uint32_t>(std::atoi(qw));
         g_dmaListAlloc = runtime.lookupFunction(kDmaListAlloc);
         if (g_dmaListAlloc)
             runtime.replaceFunction(kDmaListAlloc, &dmaListAllocThunk);

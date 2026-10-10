@@ -45,6 +45,7 @@ struct Host {
  void* metalPresenter=nullptr;
  PFN_vkExportMetalObjectsEXT exportMetalObjects=nullptr;
  uint32_t scanoutBufPixels=0;
+ bool highResScanout=false;
  uint64_t readbacks=0, primitives=0;
  struct Event {uint32_t kind,path;std::vector<uint8_t> bytes;};
  std::deque<Event> recent;
@@ -99,8 +100,65 @@ struct Host {
   if(complete){snapshotTaken=true;if(capture){std::fclose(capture);capture=nullptr;captureFull=true;}std::remove(request);std::fprintf(stderr,"[parallel-gs] captured GPU VRAM and texture registers at readback=%llu to %s\n",(unsigned long long)readbacks,request);}
  }
 
+ // Replayable dump (PS2X_GS_DUMP=<file>): the whole VRAM and the register state at a frame boundary, then
+ // every event until PS2X_GS_DUMP_FRAMES scanouts (default 120) went by. It starts when the file named by
+ // PS2X_GS_DUMP_REQUEST shows up, or after PS2X_GS_DUMP_AFTER scanouts. Same record layout as the stream
+ // capture below (kind, path-or-register, size, payload) plus kind 7, a scanout: the nine display
+ // registers, then width, height and a hash of the pixels this renderer produced.
+ FILE* dump=nullptr;
+ uint32_t dumpFramesLeft=0;
+ uint64_t scanouts=0;
+ bool dumpDone=false;
+ void dumpEvent(uint32_t kind,uint32_t path,const void* data,uint32_t size){
+  uint32_t header[3]={kind,path,size};
+  std::fwrite(header,sizeof(header),1,dump);if(size)std::fwrite(data,size,1,dump);
+ }
+ void dumpScanout(const GSParallelScanout& req,uint32_t width,uint32_t height){
+  ++scanouts;
+  const char* file=ENV_ONCE("PS2X_GS_DUMP");
+  if(!file||dumpDone)return;
+  if(dump){
+   uint64_t hash=0xcbf29ce484222325ull;
+   for(size_t i=0,n=size_t(width)*height;i<n;++i){uint32_t pixel;std::memcpy(&pixel,req.rgba+i*4u,4);hash=(hash^pixel)*0x100000001b3ull;}
+   const uint64_t payload[11]={req.pmode,req.smode1,req.smode2,req.dispfb1,req.display1,req.dispfb2,req.display2,req.bgcolor,req.vsyncTick,uint64_t(width)|(uint64_t(height)<<32),hash};
+   dumpEvent(7,0,payload,sizeof(payload));
+   if(--dumpFramesLeft==0){std::fclose(dump);dump=nullptr;dumpDone=true;std::fprintf(stderr,"[parallel-gs] dump finished: %s\n",file);}
+   return;
+  }
+  const char* request=ENV_ONCE("PS2X_GS_DUMP_REQUEST");
+  const char* after=ENV_ONCE("PS2X_GS_DUMP_AFTER");
+  bool start=after&&scanouts>=std::strtoull(after,nullptr,0);
+  if(!start&&request){if(FILE* trigger=std::fopen(request,"rb")){std::fclose(trigger);start=true;}}
+  if(!start)return;
+  // A packet cut in half by the start of the dump could not be replayed.
+  for(uint32_t path=0;path<4;++path){const auto& parser=gs.get_gif_path(path);if(parser.loop<parser.tag.NLOOP)return;}
+  dump=std::fopen(file,"wb");
+  if(!dump){dumpDone=true;return;}
+  if(request)std::remove(request);
+  const char* frames=ENV_ONCE("PS2X_GS_DUMP_FRAMES");
+  dumpFramesLeft=frames?std::max(1ul,std::strtoul(frames,nullptr,0)):120u;
+  gs.flush();
+  dumpEvent(5,0,gs.map_vram_read(0,4*1024*1024),4*1024*1024);
+  const auto& state=gs.get_register_state();
+  const auto put=[this](unsigned address,uint64_t value){dumpEvent(2,address,&value,8);};
+  put(0x1C,state.texclut.bits);put(0x3B,state.texa.bits);
+  for(unsigned c=0;c<2;++c){
+   const auto& ctx=state.ctx[c];
+   put(0x14+c,ctx.tex1.bits);put(0x08+c,ctx.clamp.bits);put(0x18+c,ctx.xyoffset.bits);
+   put(0x34+c,ctx.miptbl_1_3.bits);put(0x36+c,ctx.miptbl_4_6.bits);put(0x40+c,ctx.scissor.bits);
+   put(0x42+c,ctx.alpha.bits);put(0x47+c,ctx.test.bits);put(0x4A+c,ctx.fba.bits);
+   put(0x4C+c,ctx.frame.bits);put(0x4E +c,ctx.zbuf.bits);put(0x06+c,ctx.tex0.bits);
+  }
+  put(0x1A,1);put(0x00,state.prim.bits);put(0x1A,state.prmodecont.bits);
+  put(0x01,state.rgbaq.bits);put(0x02,state.st.bits);put(0x03,state.uv.bits);put(0x0A,state.fog.bits);
+  put(0x3D,state.fogcol.bits);put(0x44,state.dimx.bits);put(0x45,state.dthe.bits);put(0x46,state.colclamp.bits);
+  put(0x49,state.pabe.bits);put(0x22,state.scanmsk.bits);
+  put(0x50,state.bitbltbuf.bits);put(0x51,state.trxpos.bits);put(0x52,state.trxreg.bits);
+  std::fprintf(stderr,"[parallel-gs] dump started at scanout %llu: %s\n",(unsigned long long)scanouts,file);
+ }
  void remember(uint32_t kind,uint32_t path,const uint8_t* data,uint32_t size) {
   currentEventCaptured=false;
+  if(dump)dumpEvent(kind,path,data,size);
   if(!automaticSnapshotArmed&&!snapshotTaken){
    const char* after=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_AFTER_READBACKS");
    const char* request=ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_REQUEST");
@@ -155,10 +213,20 @@ static void* create(const char* path,const uint8_t* initial) {
   if(!h->context.init_instance_and_device(nullptr,0,nullptr,0))return nullptr;
 #endif
   h->device.set_context(h->context);
+  // The renderer submits its work in "frame contexts" and, before reusing one, waits for the GPU to finish
+  // what that context submitted. Granite's default of 2 makes the GS thread wait on the GPU at almost every
+  // flush; with more in flight the CPU side keeps going. PS2X_GS_FRAME_CONTEXTS=<n> (default 8).
+  {const char* contexts=std::getenv("PS2X_GS_FRAME_CONTEXTS");
+   const int count=contexts?std::atoi(contexts):8;
+   if(count>=2&&count<=32)h->device.init_frame_contexts(unsigned(count));}
 #if defined(__APPLE__)
   if(nativeRequested){auto getProc=Vulkan::Context::get_instance_proc_addr();auto getDeviceProc=reinterpret_cast<PFN_vkGetDeviceProcAddr>(getProc(h->device.get_instance(),"vkGetDeviceProcAddr"));if(getDeviceProc)h->exportMetalObjects=reinterpret_cast<PFN_vkExportMetalObjectsEXT>(getDeviceProc(h->device.get_device(),"vkExportMetalObjectsEXT"));}
 #endif
-  if(!h->gs.init(&h->device,{}))return nullptr;
+  // PS2X_GS_UPSCALE=2: super-sample with 4 samples per pixel and scan out in high resolution.
+  ParallelGS::GSOptions options{};
+  {const char* up=std::getenv("PS2X_GS_UPSCALE");
+   if(up&&std::atoi(up)>=2){options.super_sampling=ParallelGS::SuperSampling::X4;h->highResScanout=true;}}
+  if(!h->gs.init(&h->device,options))return nullptr;
   ParallelGS::Hacks hacks{};hacks.allow_blend_demote=true;h->gs.set_hacks(hacks);
   std::memcpy(h->gs.map_vram_write(0,4*1024*1024),initial,4*1024*1024);
   h->gs.end_vram_write(0,4*1024*1024);
@@ -272,7 +340,13 @@ static int scanout(void* p,GSParallelScanout* req){
  setPriv64(&priv.dispfb1,req->dispfb1);setPriv64(&priv.display1,req->display1);
  setPriv64(&priv.dispfb2,req->dispfb2);setPriv64(&priv.display2,req->display2);
  setPriv64(&priv.bgcolor,req->bgcolor);
+ // PS2X_GS_SHOW=<fbp>,<fbw>,<psm> (diagnostic, same as the native module's PS2X_GS_NATIVE_SHOW): scan out that buffer.
+ if(const char* show=ENV_ONCE("PS2X_GS_SHOW")){unsigned fbp=0,fbw=10,psm=0;std::sscanf(show,"%u,%u,%u",&fbp,&fbw,&psm);
+  const uint64_t dispfb=uint64_t(fbp)|(uint64_t(fbw)<<9)|(uint64_t(psm)<<15);setPriv64(&priv.dispfb1,dispfb);setPriv64(&priv.dispfb2,dispfb);setPriv64(&priv.pmode,(req->pmode&~3ull)|1ull);}
  h.gs.flush();
+ // With a super-sampled scanout the renderer sizes its output image from the display registers; before
+ // the game programs them that size is invalid (MoltenVK aborts on the texture). Nothing to show yet.
+ if(h.highResScanout&&((req->pmode&3ull)==0||((req->display1>>32)==0&&(req->display2>>32)==0)))return 0;
  ParallelGS::VSyncInfo info{};
  info.phase=uint32_t(req->vsyncTick&1ull);
  info.dst_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -281,6 +355,11 @@ static int scanout(void* p,GSParallelScanout* req){
  info.force_progressive=true;info.anti_blur=true;
  info.adapt_to_internal_horizontal_resolution=true;info.raw_circuit_scanout=true;
  info.internal_resolution_scanout=true;
+ info.high_resolution_scanout=h.highResScanout;
+ // PS2X_GS_SCANOUT_FLAGS=<mask> (diagnostic): 1 raw_circuit_scanout, 2 adapt_to_internal_horizontal_resolution,
+ // 4 internal_resolution_scanout, 8 anti_blur; replaces the four settings above.
+ if(const char* flags=std::getenv("PS2X_GS_SCANOUT_FLAGS")){const unsigned f=unsigned(std::strtoul(flags,nullptr,0));
+  info.raw_circuit_scanout=(f&1u)!=0;info.adapt_to_internal_horizontal_resolution=(f&2u)!=0;info.internal_resolution_scanout=(f&4u)!=0;info.anti_blur=(f&8u)!=0;}
  auto result=h.gs.vsync(info);
  auto stats=h.gs.consume_flush_stats();h.primitives+=stats.num_primitives;
  if(++h.readbacks==1||h.readbacks%120==0)
@@ -313,17 +392,20 @@ static int scanout(void* p,GSParallelScanout* req){
   // outstanding work on the device. Keep the buffer alive until completion.
   Vulkan::Fence copied;
   h.device.submit(cmd,&copied);
+  if(req->unlock)req->unlock(req->lockContext);
   copied->wait();
+  if(req->relock)req->relock(req->lockContext);
  }
  auto* src=static_cast<uint8_t*>(h.device.map_host_buffer(*h.scanoutBuffer,Vulkan::MEMORY_ACCESS_READ_BIT));
  if(!src)return 0;
  for(uint32_t y=0;y<ht;++y){
-  uint8_t* dst=req->rgba+size_t(y)*req->stride;
+  uint8_t* dst=req->rgba+size_t(y)*w*4u; // rows packed at the image's own width (the caller sizes for the largest)
   std::memcpy(dst,src+size_t(y)*iw*4u,size_t(w)*4u);
   for(uint32_t x=0;x<w;++x)dst[x*4u+3u]=255u;
  }
  req->width=w;req->height=ht;
+ h.dumpScanout(*req,w,ht);
  if(!ENV_ONCE("PS2X_PARALLEL_SNAPSHOT_ON_TEX0"))h.snapshot_if_requested();
  return 1;
 }
-extern "C" const GSParallelAPI* black_parallel_gs_api(){static const GSParallelAPI api{5,create,destroy,reset,gif,reg,image,flush,wait,read,write,fifo,clear,scanout,attachWindow};return &api;}
+extern "C" const GSParallelAPI* black_parallel_gs_api(){static const GSParallelAPI api{6,create,destroy,reset,gif,reg,image,flush,wait,read,write,fifo,clear,scanout,attachWindow};return &api;}

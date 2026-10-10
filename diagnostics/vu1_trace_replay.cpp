@@ -26,6 +26,7 @@ namespace
     struct Record
     {
         uint32_t startPC = 0, top = 0, itop = 0, maxCycles = 0;
+        uint32_t header[8]{}; // as stored, for --rebaseline
         bool resumed = false;
         uint32_t unit = 1;
         VU1State before{}, after{};
@@ -71,6 +72,7 @@ namespace
                 break;
             }
             Record r;
+            std::memcpy(r.header, header, sizeof(header));
             r.resumed = kind == 0x00525556u;
             r.unit = unitDigit - '0';
             r.startPC = header[1]; r.top = header[2]; r.itop = header[3]; r.maxCycles = header[4];
@@ -187,7 +189,20 @@ namespace
         {
             for (size_t i = 0; i < a.data.size(); ++i)
                 if (a.data[i] != b.data[i])
-                    return "data memory differs at 0x" + std::to_string(i);
+                {
+                    // First differing qword, both versions, and how many qwords differ in all.
+                    const size_t q = i & ~size_t{15};
+                    uint32_t wa[4], wb[4];
+                    std::memcpy(wa, &a.data[q], 16);
+                    std::memcpy(wb, &b.data[q], 16);
+                    size_t count = 0;
+                    for (size_t j = 0; j + 16 <= a.data.size(); j += 16)
+                        count += std::memcmp(&a.data[j], &b.data[j], 16) != 0;
+                    char text[200];
+                    std::snprintf(text, sizeof(text), "data memory differs at 0x%zx: %08x %08x %08x %08x != %08x %08x %08x %08x (%zu qwords differ)",
+                                  q, wa[0], wa[1], wa[2], wa[3], wb[0], wb[1], wb[2], wb[3], count);
+                    return text;
+                }
         }
         if (a.packets.list.size() != b.packets.list.size())
             return "packet count " + std::to_string(a.packets.list.size()) + " != " + std::to_string(b.packets.list.size());
@@ -203,11 +218,14 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        std::fprintf(stderr, "usage: %s trace.bin [--bench N] [--limit K] [--status-mask HEX]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s trace.bin [--bench N] [--limit K] [--status-mask HEX] [--rebaseline OUT]\n"
+                             "  --rebaseline OUT: write the trace again with the reference engine's results as the expected\n"
+                             "                    ones (after a deliberate change of the reference timing model)\n", argv[0]);
         return 2;
     }
     int bench = 0;
     const char *exportDir = nullptr;
+    const char *rebaselinePath = nullptr;
     int benchEngine = -1; // --bench-engine reference|fast
     VU1Interpreter::Engine candidate = VU1Interpreter::Engine::Fast; // --engine fast|recompiled
     size_t limit = 0;
@@ -218,6 +236,7 @@ int main(int argc, char **argv)
         else if (!std::strcmp(argv[i], "--bench-engine") && i + 1 < argc) benchEngine = !std::strcmp(argv[++i], "fast") ? 1 : 0;
         else if (!std::strcmp(argv[i], "--engine") && i + 1 < argc) candidate = !std::strcmp(argv[++i], "recompiled") ? VU1Interpreter::Engine::Recompiled : VU1Interpreter::Engine::Fast;
         else if (!std::strcmp(argv[i], "--export") && i + 1 < argc) exportDir = argv[++i];
+        else if (!std::strcmp(argv[i], "--rebaseline") && i + 1 < argc) rebaselinePath = argv[++i];
         else if (!std::strcmp(argv[i], "--limit") && i + 1 < argc) limit = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--status-mask") && i + 1 < argc) statusMask = std::strtoul(argv[++i], nullptr, 16);
     }
@@ -243,6 +262,7 @@ int main(int argc, char **argv)
     // DIR/coverage.bin (PS2X_VU_CATALOG layout) for ps2x_vu1_recompile.
     std::map<std::pair<uint32_t, uint64_t>, std::vector<uint8_t>> coverageMaps;
     Result a, b;
+    std::FILE *rebaseline = rebaselinePath ? std::fopen(rebaselinePath, "wb") : nullptr;
     size_t fastMismatch = 0, recordedMismatch = 0;
     uint64_t pairs = 0, packets = 0;
     for (size_t n = 0; n < records.size(); ++n)
@@ -258,6 +278,15 @@ int main(int argc, char **argv)
         }
         runRecord(*reference, r, a);
         reference->setCoverageMap(nullptr);
+        if (rebaseline)
+        {
+            std::fwrite(r.header, sizeof(r.header), 1, rebaseline);
+            std::fwrite(&r.before, sizeof(VU1State), 1, rebaseline);
+            std::fwrite(r.code->data(), 1, r.code->size(), rebaseline);
+            std::fwrite(r.dataBefore.data(), 1, r.dataBefore.size(), rebaseline);
+            std::fwrite(&a.state, sizeof(VU1State), 1, rebaseline);
+            std::fwrite(a.data.data(), 1, a.data.size(), rebaseline);
+        }
         runRecord(*fast, r, b);
         pairs += a.pairs; packets += a.packets.list.size();
         const std::string d = diffResult(a, b, statusMask);
@@ -270,9 +299,18 @@ int main(int argc, char **argv)
         if (!g.empty() && recordedMismatch++ < 6)
             std::printf("record %zu (pc=0x%x): reference != in-game result: %s\n", n, r.startPC, g.c_str());
     }
+    if (rebaseline)
+    {
+        std::fclose(rebaseline);
+        std::printf("rebaselined %zu records to %s\n", records.size(), rebaselinePath);
+    }
     std::printf("records=%zu pairs=%llu packets=%llu fast-vs-reference mismatches=%zu reference-vs-recorded mismatches=%zu (status mask %03x)\n",
                 records.size(), static_cast<unsigned long long>(pairs), static_cast<unsigned long long>(packets),
                 fastMismatch, recordedMismatch, statusMask);
+    for (unsigned unit = 0; unit < 2u; ++unit)
+        if (candidates[unit] && candidates[unit]->directPairs() != 0u)
+            std::printf("VU%u: %.1f%% of the pairs ran in direct blocks\n", unit,
+                        100.0 * double(candidates[unit]->directPairs()) / double(std::max<uint64_t>(candidates[unit]->executedPairs(), 1u)));
 
     if (exportDir)
     {

@@ -15,13 +15,17 @@
 #include "runtime/ps2_vu1.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include <map>
 #include <set>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#include "vu1_direct_emit.inl"
 
 namespace
 {
@@ -102,11 +106,11 @@ int main(int argc, char **argv)
     }
 
     // (lower, upper, bits, writtenVi, shadowReg, mayEnd) -> pair function id
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t>, uint32_t> pairIds;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint64_t, uint32_t>, uint32_t> pairIds;
     std::string pairFunctions, imageFunctions, table[2], programTable;
     size_t programCount = 0;
     std::set<std::pair<uint32_t, uint64_t>> emittedImages;
-    size_t totalPairs = 0, flagWriters = 0, liveWriters = 0;
+    size_t totalPairs = 0, flagWriters = 0, liveWriters = 0, directBlocks = 0, directPairs = 0;
 
     for (const std::string &path : imagePaths)
     {
@@ -152,7 +156,8 @@ int main(int argc, char **argv)
             continue;
         std::vector<Facts> facts(kPairs);
         VU1Interpreter::describeImage(unit == 0u ? VU1Interpreter::Unit::VU0 : VU1Interpreter::Unit::VU1,
-                                      code.data(), static_cast<uint32_t>(code.size()), facts.data(), kPairs);
+                                      code.data(), static_cast<uint32_t>(code.size()), facts.data(), kPairs,
+                                      isProgram ? programAddr : 0u, isProgram ? programSize : 0u);
 
         auto compilable = [&](uint32_t p)
         {
@@ -208,7 +213,81 @@ int main(int argc, char **argv)
             maxRun = std::max(maxRun, run);
         }
 
-        char text[512];
+        // Direct blocks (vu1_direct_emit.inl): blockLength[p] != 0 at the first pair of a block, inBlock[p]
+        // for the pairs it covers. PS2X_VU_RECOMPILE_NO_DIRECT=1 keeps every pair on stepPair().
+        std::vector<uint32_t> blockLength(kPairs, 0u);
+        std::vector<bool> inBlock(kPairs, false), blockBranches(kPairs, false);
+        if (!std::getenv("PS2X_VU_RECOMPILE_NO_DIRECT"))
+        {
+            std::vector<bool> target(kPairs, false), afterCall(kPairs, false);
+            for (uint32_t p = 0; p < kPairs; ++p)
+            {
+                if (!included[p])
+                    continue;
+                bool unconditional = false;
+                int32_t offsetPairs = 0;
+                if (isStaticBranch(facts[p], unconditional, offsetPairs))
+                    target[static_cast<uint32_t>(static_cast<int32_t>(p) + 1 + offsetPairs) & (kPairs - 1u)] = true;
+                // A subroutine comes back to the pair after the call's delay slot through JR; the next four
+                // pairs then need the full hazard check (m_hazardUnknown), which blocks do not make.
+                const uint32_t op = (facts[p].lower >> 25) & 0x7Fu;
+                if ((facts[p].bits & VU1Interpreter::PairIBit) == 0u && (op == 0x21u || op == 0x25u))
+                    for (uint32_t q = p + 2u; q < p + 6u && q < kPairs; ++q)
+                        afterCall[q] = true;
+            }
+            const auto endsProgram = [&](uint32_t p)
+            {
+                return (facts[p].bits & VU1Interpreter::PairEndBits) != 0u || (facts[previous(p)].bits & VU1Interpreter::PairEndBits) != 0u;
+            };
+            const auto afterBranch = [&](uint32_t p)
+            {
+                return (facts[previous(p)].bits & (VU1Interpreter::PairBranch | VU1Interpreter::PairIndirect)) != 0u;
+            };
+            const auto plain = [&](uint32_t p) // a pair a block can hold, the branch rules aside
+            {
+                return p < kPairs && included[p] && direct::pairIsDirect(facts[p], endsProgram(p));
+            };
+            uint32_t start = kPairs, length = 0u;
+            const auto close = [&](bool branches)
+            {
+                if (start < kPairs && length >= 3u)
+                {
+                    blockLength[start] = length;
+                    blockBranches[start] = branches;
+                    for (uint32_t q = start; q < start + length; ++q)
+                        inBlock[q] = true;
+                }
+                start = kPairs;
+                length = 0u;
+            };
+            for (uint32_t p = 0; p < kPairs; ++p)
+            {
+                if (target[p])
+                    close(false);
+                const bool branch = plain(p) && direct::pairIsBranch(facts[p]);
+                if (!plain(p) || afterBranch(p) || (branch && (length == 0u || !plain(p + 1u) || direct::pairIsBranch(facts[p + 1u]) || target[p + 1u])))
+                {
+                    close(false);
+                    continue;
+                }
+                if (length == 0u)
+                    start = p;
+                ++length;
+                if (branch)
+                {
+                    ++length; // the delay slot
+                    ++p;
+                    // The block goes on after a conditional branch (it leaves through a side exit when taken)
+                    // unless the next pair must start a block of its own.
+                    const uint32_t op = (facts[p - 1u].lower >> 25) & 0x7Fu;
+                    if (op == 0x20u || !plain(p + 1u) || target[p + 1u] || length >= 96u)
+                        close(true);
+                }
+            }
+            close(false);
+        }
+
+        char text[1024];
         std::string body;
         uint32_t count = 0;
         for (uint32_t p = 0; p < kPairs; ++p)
@@ -216,18 +295,53 @@ int main(int argc, char **argv)
             if (!included[p])
                 continue;
             ++count;
+            if (blockLength[p] != 0u)
+            {
+                ++directBlocks;
+                directPairs += blockLength[p];
+                std::snprintf(text, sizeof(text), "            case 0x%04xu:\n#if defined(__aarch64__)\n            B%04x:\n                if (direct && vu.directBlockAllowed(0x%04xu))\n                {\n",
+                              p * 8u, p * 8u, p * 8u);
+                body += text;
+                // Continuing at another block of this function skips the dispatch switch; the loop's own
+                // entry conditions that a block can change (the cycle budget) are tested here instead.
+                const auto chain = [&](uint32_t pc) -> std::string
+                {
+                    if (pc / 8u >= kPairs || blockLength[pc / 8u] == 0u)
+                        return "continue;";
+                    char jump[160];
+                    std::snprintf(jump, sizeof(jump), "if (vu.m_cycle + %uu <= budgetEnd && !vu.m_stopRequested) goto B%04x; continue;", maxRun, pc);
+                    return jump;
+                };
+                char again[200];
+                std::snprintf(again, sizeof(again), "c + %uu <= budgetEnd && !vu.m_stopRequested && vu.directBlockAllowed(0x%04xu)", maxRun + blockLength[p], p * 8u);
+                body += direct::emitBlock(facts, p, blockLength[p], codeSize - 1u, chain, again);
+                body += "                }\n#endif\n                return R::NotHandled;\n";
+            }
+            if (inBlock[p])
+                continue;
             const Facts &f = facts[p];
             const Facts &before = facts[previous(p)];
             const bool mayEnd = (f.bits & VU1Interpreter::PairEndBits) != 0u || (before.bits & VU1Interpreter::PairEndBits) != 0u;
-            const auto key = std::make_tuple(f.lower, f.upper, uint32_t(f.bits), uint32_t(f.writtenVi), uint32_t(f.shadowReg), mayEnd, codeSize);
+            bool unconditional = false;
+            int32_t offsetPairs = 0;
+            const bool delaySlot = isStaticBranch(before, unconditional, offsetPairs) || isIndirectJump(before);
+            // A pair is only entered from the dispatch loop (which leaves pending branches to the interpreter)
+            // or by falling through from the pair before it.
+            // (A branch pair itself goes through the pending-branch step: that is where its delay counts down.)
+            const bool branches = (f.bits & (VU1Interpreter::PairBranch | VU1Interpreter::PairIndirect)) != 0u;
+            const uint32_t bits = uint32_t(f.bits) | (delaySlot || branches ? 0u : uint32_t(VU1Interpreter::PairNoPendingBranch));
+            // The hazard masks depend on the pairs around this one, so equal instruction words can need different bodies.
+            const auto key = std::make_tuple(f.lower, f.upper, bits, uint32_t(f.writtenVi), uint32_t(f.shadowReg), mayEnd, codeSize,
+                                             f.hazardReads, f.hazardWrites);
             auto found = pairIds.find(key);
             if (found == pairIds.end())
             {
                 found = pairIds.emplace(key, static_cast<uint32_t>(pairIds.size())).first;
                 std::snprintf(text, sizeof(text),
                               "    static inline __attribute__((always_inline)) R P%u(VU1Interpreter &vu, uint32_t pc, VU_BLOCK_PARAMS)\n"
-                              "    { return vu.stepPair(pc, 0x%08xu, 0x%08xu, 0x%04xu, %uu, %uu, %s, 0x%xu, vuData, dataSize, gs, memory, budgetEnd); }\n",
-                              found->second, f.lower, f.upper, unsigned(f.bits), unsigned(f.writtenVi), unsigned(f.shadowReg),
+                              "    { return vu.stepPair(pc, 0x%08xu, 0x%08xu, 0x%05xu, %uu, %uu, 0x%llxull, 0x%xu, %s, 0x%xu, vuData, dataSize, gs, memory, budgetEnd); }\n",
+                              found->second, f.lower, f.upper, bits, unsigned(f.writtenVi), unsigned(f.shadowReg),
+                              static_cast<unsigned long long>(f.hazardReads), unsigned(f.hazardWrites),
                               mayEnd ? "true" : "false", codeSize);
                 pairFunctions += text;
             }
@@ -242,9 +356,6 @@ int main(int argc, char **argv)
             }
             const bool stall = (f.bits & VU1Interpreter::PairStall) != 0u;
             const bool checkResult = mayEnd || stall;
-            bool unconditional = false;
-            int32_t offsetPairs = 0;
-            const bool delaySlot = isStaticBranch(before, unconditional, offsetPairs) || isIndirectJump(before);
             const uint32_t following = next(p);
             const bool lastOfRun = !included[following] || following == 0u;
             std::snprintf(text, sizeof(text), "            case 0x%04xu:\n", p * 8u);
@@ -272,6 +383,7 @@ int main(int argc, char **argv)
                       "    static R %s%u_%016llx(VU1Interpreter &vu, uint32_t codeSize, VU_BLOCK_PARAMS)\n"
                       "    {\n"
                       "        if (codeSize != 0x%xu) return R::NotHandled;\n"
+                      "        const bool direct = vu.directBlocksUsable(vuData, dataSize); (void)direct;\n"
                       "        for (;;)\n"
                       "        {\n"
                       "            if (vu.m_cycle + %uu > budgetEnd || vu.m_stopRequested || vu.m_state.branchPending ||\n"
@@ -312,6 +424,7 @@ int main(int argc, char **argv)
                  "#define VU_BLOCK_ARGS vuData, dataSize, gs, memory, budgetEnd\n"
                  "struct VuRecompiled\n{\n    using R = VU1Interpreter::StepResult;\n\n",
                  emittedImages.size(), totalPairs, pairIds.size());
+    std::fputs(direct::runtimeHelpers(), out);
     std::fputs(pairFunctions.c_str(), out);
     std::fputs("\n", out);
     std::fputs(imageFunctions.c_str(), out);
@@ -327,7 +440,8 @@ int main(int argc, char **argv)
                  "        count = %zuu;\n        return list;\n    }\n};\n#undef VU_BLOCK_PARAMS\n#undef VU_BLOCK_ARGS\n",
                  table[0].c_str(), table[1].c_str(), programTable.c_str(), programCount);
     std::fclose(out);
-    std::printf("wrote %s: %zu images+programs (%zu programs), %zu pairs, %zu distinct pair bodies; FMAC flag writers %zu, still computing flags %zu\n",
-                outputPath, emittedImages.size(), programCount, totalPairs, pairIds.size(), flagWriters, liveWriters);
+    std::printf("wrote %s: %zu images+programs (%zu programs), %zu pairs, %zu distinct pair bodies; FMAC flag writers %zu, still computing flags %zu; "
+                "%zu direct blocks covering %zu pairs\n",
+                outputPath, emittedImages.size(), programCount, totalPairs, pairIds.size(), flagWriters, liveWriters, directBlocks, directPairs);
     return 0;
 }

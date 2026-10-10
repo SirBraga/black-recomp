@@ -925,3 +925,273 @@ Efeito no Level_00 (mesmo roteiro):
 **Ainda errado nessa visão:** a casca do prédio (paredes de tijolo, teto, janelas) que aparece no PCSX2 não é desenhada; vê-se o cenário externo e o céu atrás da mesa. É igual com a VU de referência (`PS2X_VU_RECOMPILED=0`), então não vem da VU1 recompilada; fica para investigar no lado do EE (visibilidade/setores) ou no stream.
 
 Conferido e sem problema: os códigos de função COP1 usados pelo jogo (0x00–0x07, 0x16, 0x18, 0x1C, 0x1E, 0x24, 0x28, 0x29, 0x32, 0x34, 0x36 e CVT.S.W) estão todos tratados; `VRSQRT` da VU0 ignora o numerador, mas as 394 ocorrências usam `vf0w` (=1).
+
+## VF0 zerado nas threads secundárias: casca do prédio sumida e jogador preso (2026-10-08)
+
+**Causa:** `R5900Context()` zerava tudo e só o contexto da thread principal recebia `vu0_vf[0] = (0,0,0,1)`. Toda thread do jogo criada depois (e invocações de interrupção/callback com contexto novo) rodava com VF0 = 0. O jogo carrega 1.0 com `vaddw.x vfN, vf0, vf0w`; na thread que carrega a fase, o construtor das seções do mundo (`func_00125C60`) montava a matriz identidade em `obj+0x70` e saía tudo zero. A esfera de visibilidade (`func_0012A158`: matriz × `obj+0x60` → `obj+0x20`, registrada na árvore de esferas `func_00272C28`) ia para a origem.
+
+**Sintomas que isso causava:** paredes/teto/janelas da sala inicial ausentes, objetos aparecendo e sumindo ao girar a câmera, personagem sem sair do lugar (a animação da arma respondia).
+
+**Correção:** `vu0_vf[0] = (0,0,0,1)` no construtor de `R5900Context` (`ps2xRuntime/include/ps2_runtime.h`). Header global: rebuild completo.
+
+**Como foi achado (método reutilizável):** o savestate do PCSX2 (`~/Library/Application Support/PCSX2/sstates/*.p2s`) é um zip com membros zstd (método 93; extrair o membro cru e passar no `zstd -d`). `eeMemory.bin` são os 32 MiB do EE. Nossa RAM sai com `PS2X_RAM_DUMP=<arquivo>` + `<arquivo>.trigger`. O heap do jogo é determinístico: os endereços dos objetos coincidem entre as duas RAMs, então dá para comparar objeto por objeto (classe pelo ponteiro de vtable em `obj+0x10`). As 31 seções do mundo (vtable `0x3DC920`, draw `func_00127CF0`) existiam e estavam habilitadas nas duas; só `+0x20` e `+0x70..0xAF` diferiam.
+
+Mapa útil: fila de desenho em `[D_0040F4C0]+0x14+0xCA58 + balde*0x18` = `{itens, chaves, n, cap}`, item de 0x14 bytes (`geo, matriz, ...`); teste caixa × 6 planos `func_0026DB20` (microprograma VU0 `0x880`; 0 fora, 1 cruza, 2 dentro), usado para oclusores (`D_0040F4F4`) e frustum (`[D_0040F4C0]+0xCFD0`). Sonda: `ps2recomp/overrides/black_cull_probe.cpp` (`BLACK_CULL_PROBE`, `BLACK_CULL_FORCE`, `BLACK_CULL_SAMPLES`, `BLACK_QUEUE_SITES`). `black_debug.cpp`: `[black-fs] open` agora mostra código de erro e nº de handles; `BLACK_WATCH_ENTRY` imprime o histórico ao armar.
+
+Quadro depois da correção: `recomp/diagnostics/path3-gate/vf0fix.png`.
+
+**Cuidado ao medir:** `path3_gate_test.py` com `UNSET=PS2X_GS_SDL_GPU` e `prof.py` com `PS2X_GS_SDL_GPU=<unset>` caem no rasterizador de CPU; para paraLLEl-GS é preciso passar `PS2X_GS_PARALLEL=1 PS2X_GS_PARALLEL_MODULE=… PS2X_GS_MOLTENVK=…` como o launcher faz.
+
+**Pendente:** `func_0027CAB8` (abrir arquivo) falha de forma intermitente, cada rodada num arquivo diferente (`bg1_pst.db`, `speech.slb`, `CredRoll.ssh`…), com o arquivo presente — só há 2 handles e parece corrida entre threads; ferramentas do difftest de macro VU0 (`vu0_macro_emit.cpp`, `vu0_macro_difftest.cpp`) ainda sem seção própria; `VSQRT`/`VRSQRT` de macro com operando negativo.
+
+## Arredondamento do EE: truncar, como o PS2 (2026-10-08)
+
+**Sintoma:** depois do conserto do VF0, objetos/texturas ainda sumiam e voltavam ao olhar para direções específicas.
+
+**Causa:** o código do EE (COP1 e macros COP2 da VU0) rodava com o arredondamento padrão do host (para o mais próximo). O PS2 trunca (em direção a zero). O sin/cos embutido do jogo (ex.: `func_0016C728`, init dos oclusores) reduz o ângulo somando e subtraindo `1.5·2^23` (`vmsubai`/`vmaddai` com `I = 0x4B400000`) para obter a parte inteira de `x/2π`; isso só funciona truncando. Com round-to-nearest, sin(350°) saía −0,16727 em vez de −0,17365 (reproduzido bit a bit numa simulação IEEE fora do jogo). Matrizes de rotação e planos dos oclusores ficavam tortos → oclusão errada em certos ângulos.
+
+**Correção:** `std::fesetround(FE_TOWARDZERO)` no início da `GameThread` (`ps2_runtime.cpp`); todo código EE do jogo roda nela. `PS2X_EE_ROUND_NEAREST=1` volta ao padrão do host para A/B. O HLE `__ieee754_rem_pio2f` (`LibC.cpp`) passou de `nearbyintf` para `roundf` para não depender do modo. A VU em microprograma já truncava (`ps2_vu1_core.cpp`).
+
+**Validação:** as matrizes dos 6 oclusores (`[D_0040F4F4]+0xD0`, `obj+0x70..0x10F`) ficaram idênticas bit a bit às do savestate do PCSX2 (antes diferiam). O teste caixa × planos (`func_0026DB20`, programa VU0 `0x880`) já estava certo: 8000 amostras reais batem com um modelo offline. Quadro: `recomp/diagnostics/path3-gate/roundfix-spawn.png`.
+
+Ferramentas: `ps2recomp/diagnostics/vu_disasm.py <imagem> <pc hex> <pares>` (desmontador simples de microcódigo VU); `BLACK_FRAME_RING=N` + `BLACK_DUMP_EVERY=2` dá uma sequência de quadros (`BLACK_DUMP_EVERY=1` não funciona). Teclado: WASD só no analógico esquerdo, setas só no direcional, IJKL câmera (`ps2_pad.cpp`).
+
+**Não tratado:** a divisão do EE no PCSX2 arredonda para o mais próximo por padrão; aqui `div.s` também trunca agora. `VSQRT`/`VRSQRT` de macro com operando negativo e as aberturas de arquivo intermitentes seguem pendentes.
+
+### Em aberto: chão liso/buracos perto da porta da sala inicial (2026-10-08)
+
+Pose reproduzível: no spawn, `rs_left:0.7` no roteiro de pad (tempo em segundos do guest; a fase começa em g≈30 ou g≈62 conforme a rodada, então conferir o quadro). Quadro: `recomp/diagnostics/path3-gate/floor-defect-pose.png`. O que já foi descartado:
+- culling das seções do mundo (`BLACK_CULL_FORCE=1` não muda; programa VU0 `0x880` confere com modelo offline);
+- renderizador (paraLLEl-GS e rasterizador de CPU mostram o mesmo chão liso);
+- o triângulo do chão chega ao GS com textura PSMT4 128×128 mipmapada (`MXL=4`, `MMIN=4`, `K=-50`, `L=0`), paleta normal e UV plausíveis (`gif_prims_at_point.py <captura> <x> <y> <bytes finais> <n>` lista as primitivas que cobrem um ponto da tela).
+Hipótese atual: falta uma camada de detalhe (sujeira/entulho) desenhada por objetos, não pelas seções do mundo. A fila de desenho do PCSX2 tem mais itens em todas as faixas, mas a pose do savestate é outra, então não dá para comparar item a item. Falta um savestate do PCSX2 na mesma pose.
+
+## VU: stalls de pipeline no caminho rápido — geometria que sumia conforme a câmera (2026-10-09)
+
+**Sintoma:** piso, partes do braço/arma, decalques e fogo sumiam e voltavam dependendo de para onde a câmera olhava. Captura do usuário (`BLACK_CAPTURE=1` no launcher) mostrou que as seções eram enfileiradas com o flag de clipping certo, mas os triângulos próximos não chegavam ao GS: era o clipper da VU1.
+
+**Causa:** o caminho rápido da VU (`stepPair`, usado pelo interpretador rápido e pelo código recompilado) não contava três esperas que o hardware faz, e o pipeline de flags anda por ciclo. Um `FMAND` do clipper lia os flags da instrução errada.
+1. Hazard de registrador: um par que lê VF/VI ainda no pipeline de quem escreve espera (sem bypass).
+2. Recurso da EFU: uma operação da EFU espera a anterior terminar (`m_efuResourceReady`).
+3. O stall é reavaliado depois de cada espera: um `XGKICK` espera a transferência anterior inteira.
+
+**Como foi isolado:** teleporte para a pose da captura (`BLACK_POSE_REF=<RAM>` + `<RAM>.trigger`, em `black_cull_probe.cpp`); `PS2X_VU_ACCURATE=1` conserta; bisseção com `PS2X_VU_ACCURATE_PARTS` (1 = stalls, 2 = VF atrasado, 4 = ACC, 8 = VI) mostrou que só os stalls bastam. Duas hipóteses anteriores estavam erradas e foram descartadas por teste: elisão de flags MAC (não conserta) e "só hazards de registrador" (faltavam EFU e a reavaliação).
+
+**Correção:**
+- `PairFacts::hazardReads/hazardWrites` (derivados de `InstructionUsage`), passados como literais a `stepPair`; bits novos `PairEfu` e `PairIndirect`.
+- `pruneFastHazards()` reduz as máscaras ao que pode de fato travar: uma leitura só espera por registrador escrito num dos 3 pares executados antes (predecessores pelo fluxo do código). ACC nunca trava. Depois de `JR/JALR` os predecessores são desconhecidos: os 4 pares seguintes passam por `waitHazardsOfPair()` (fora do caminho quente) e as escritas em volta de todo salto indireto ficam registradas.
+- O motor de referência passou a usar stalls por padrão; `PS2X_VU_NO_HAZARDS=1` desliga nos dois motores.
+- A elisão de flags MAC ficou desligada em programas que têm leitor de flags (a análise conta pares, não ciclos); `PS2X_VU_FLAG_ELISION=1` religa.
+- Resultado no gerador: 8.254 corpos de par, 292 com checagem de leitura, 2.726 com marcação de escrita.
+
+**Validação:** rápido × referência = 0 divergências em 3,17 M pares (VU1) e 395 k (VU0). O trace antigo tinha 189 registros com P diferente (gravados com a temporização antiga): `ps2x_vu1_trace_replay <trace> --rebaseline <saida>` regrava os resultados esperados com a referência; trace antigo em `vu-trace/level00.pre-stalls.bak`. No jogo, com o interpretador rápido corrigido, o piso volta na pose da captura.
+
+**Armadilhas desta rodada:**
+- Sem `black_vu1_recompiled.inc` o runner cai no interpretador de referência: um teste "no modo normal" sem o arquivo gerado não testa o caminho rápido. Para testar o rápido sem regenerar: `PS2X_VU_FAST=1 PS2X_VU_RECOMPILED=0`.
+- Mudar a assinatura de `stepPair` quebra a compilação do gerador enquanto o `.inc` antigo existir: mover o `.inc` para fora antes de rodar `build_vu_recompiled.sh`.
+- Embutir a checagem em todo par fez a compilação do `.inc` passar de uma hora; por isso a poda.
+
+## 16:9 e janela (2026-10-09)
+
+- `BLACK_WIDESCREEN=1` (`black_widescreen.cpp`): o jogo decide 16:9 por `sceScfGetAspect()` via `func_0026F2E0`; o override faz essa função responder 16:9 e força `settings+4 = 1` em `func_00108BB8`.
+- `PS2X_DISPLAY_ASPECT=1.7778` estica a apresentação; `PS2X_WINDOW_SIZE=1920x1080` é em pixels reais (em Retina vira 960×540 pontos).
+- `PS2X_GS_UPSCALE=2|4` (supersampling do paraLLEl-GS + scanout em alta resolução) existe mas derruba o jogo na inicialização no MoltenVK (textura Metal com altura inválida). Não usar ainda.
+- O savestate do PCSX2 usado como referência está em 16:9 com escala 1,3333 no visor (o jogo usa 1,2): comparar filas de desenho com ele exige o mesmo modo.
+
+## Correções tardias de 2026-10-09 (EE, libm, compilação)
+
+- **Teste diferencial do EE** (`ps2recomp/diagnostics/ee_difftest.cpp`, alvo `ps2x_ee_difftest`): 2557 palavras distintas do jogo contra um modelo independente do R5900, 0 divergências depois de corrigir MOVZ/MOVN (copiavam 32 bits), PSLLVW/PSRLVW/PSRAVW (operandos trocados) e `rsqrt.s` com divisor zero/denormal. Sem referência ainda: `pmulth`, `qfsrv`, `ll`, fluxo de controle, máscara de endereço de LQ/SQ.
+- **libm de `double`**: as stubs liam/escreviam `double` pelo FPU; no EE `double` é soft-float (GPR de 64 bits). Corrigido em `LibC.cpp` (`libmDoubleArg`/`libmSetDoubleResult`). Era a causa das partículas grossas.
+- **`-ffp-contract=off`** em todo o runtime (`ps2xRuntime/CMakeLists.txt`): o FPU e o VU do PS2 multiplicam e somam em passos separados; o Clang no arm64 fundia em FMA. Os traces do VU foram regravados.
+- **Supersampling (`PS2X_GS_UPSCALE=2`)**: o paraLLEl-GS renderiza em 4×, mas a leitura do scanout na CPU sai com o layout errado (imagem repetida). Desligado; pendente junto com a apresentação nativa (`PS2X_GS_NATIVE_PRESENT=1`, ainda não conferida visualmente).
+- O patch `0001-black-runtime-fixes.patch` agora inclui `ps2xRuntime/CMakeLists.txt` no `git diff`.
+
+## VU: caminho para o backend direto (2026-10-09)
+
+Objetivo: custo por par bem abaixo do console (3,39 ns/par no trace `level00`), para caber 120 atualizações/s. Medidas no replay (`ps2x_vu1_trace_replay ... --engine recompiled --bench N --bench-engine fast`), sempre com 0 divergências contra a referência:
+
+| etapa | ns/par |
+|---|---|
+| início do dia (stalls corretos, elisão de flags ciente de stall) | 13,6 |
+| cache da análise por imagem + flags sob demanda (só 5 programas quentes recompilados) | 9,9 |
+| aritmética FMAC em flush-to-zero | 8,7 |
+
+O que mudou no núcleo (`ps2_vu1_core.cpp`, `ps2_vu1_upper.inl`, `ps2_vu1.h`):
+
+- **`ImageAnalysis`**: decodificação, fatos por par e donos recompilados ficam guardados por conteúdo da imagem (hash + tamanho). O jogo reenvia os mesmos microprogramas o tempo todo; antes cada envio redecodificava e reanalisava 2048 pares e recasava os 70 programas.
+- **Flags sob demanda (`LazyFlags`)**: em imagens sem leitor do registrador de status (todo o VU1 do jogo), um FMAC vivo só grava os operandos do último estágio (`x`, `y`, tipo) num anel de 8; MAC/status são derivados em `resolveLazyFlags()` quando um FMEQ/FMAND/FMOR/FS* lê, ou no fim da execução. `PS2X_VU_NO_LAZY_FLAGS=1` desliga. Flags sticky de Z/S/U/O não são mantidas nesse modo (já não eram com a elisão).
+- **Flush-to-zero**: `runFast` liga FPCR.FZ. Com FZ e arredondamento para zero, add/sub/mul nunca produzem denormal nem infinito e tratam operando denormal como zero, então a "normalização" do PS2 sai de graça; resta trocar inf/NaN de operando pelo maior finito (3 instruções NEON). É o mesmo modo que o PCSX2 usa no VU. `fzLaneFlags()` reconstrói Z/S/U a partir dos operandos (soma/produto exato em `double`). A referência não usa FZ, mas passou a normalizar o produto intermediário de MADD/MSUB/OPMSUB para ter a mesma semântica (1 registro do `level00` muda; regravar com `--rebaseline`).
+- MAX/MINI/ABS/ITOF/FTOI/CLIP continuam com normalização completa dos operandos.
+
+Ciclo de desenvolvimento rápido: gerar o `.inc` só com os programas quentes (`prog1-0000-{d1574f8a…,fc1517cb…,bd4e199d…,92ff0071…,f6eba9e7…}.bin`) compila em ~10 min em vez de 20–40; sem `.inc` nenhum, ~4 min (valida o motor rápido interpretado). `PS2X_VU_PC_HISTOGRAM=<arquivo>` (motor rápido interpretado) grava contagem e ciclos por par de cada imagem. No `level00`: stalls são 3,5% dos ciclos; dois laços de 19 pares (0x630 e 0x6C8 do programa `d1574f8a`) somam 48% dos pares executados.
+
+### Contabilidade por par, XGKICK sob demanda e blocos diretos (2026-10-09, continuação)
+
+- `stepPair` só restaura VF0/VI0 quando o par pode escrevê-los (`vuPairMayWriteZeroRegister`) e só passa pelo desvio pendente em pares que são desvio ou delay slot (bit `PairNoPendingBranch`, posto pelo gerador). Cuidado: o par do próprio desvio precisa passar por ali, é onde o atraso é contado.
+- **XGKICK sob demanda**: os motores rápidos não avançam mais a transferência PATH1 ciclo a ciclo; `syncXgkick()` a traz até o ciclo atual antes de qualquer gravação na memória do VU, do XGKICK seguinte e do fim da execução. No fim do programa `flushPipelines()` avança direto de qword em qword.
+- **Blocos diretos** (`ps2recomp/diagnostics/vu1_direct_emit.inl`): o gerador escreve NEON puro para trechos em linha reta do VU1 (FMAC add/sub/mul e variantes, MAX/MINI/ABS/ITOF/FTOI, LQ/SQ e variantes, inteiros, MOVE/MR32, MTIR/MFIR, FMEQ/FMAND/FMOR e, no fim, um desvio condicional com seu delay slot). VF/VI/ACC ficam em variáveis locais; ciclo, PC e contagem de pares são gravados uma vez no fim; a confirmação de Q/P/CLIP é uma comparação por par. O gerador rastreia quais componentes são sabidamente normais para dispensar o ajuste de operando. Pares fora do conjunto, com stall possível, fim de programa, ou até 4 pares depois de um retorno de sub-rotina continuam em `stepPair`. Se a condição de entrada falha (`m_hazardUnknown`, flags não preguiçosas, orçamento), a função devolve `NotHandled` e o motor interpretado rápido executa aqueles pares.
+- Depuração: `PS2X_VU_NO_DIRECT=1` (runtime) e `PS2X_VU_RECOMPILE_NO_DIRECT=1` (gerador) desligam os blocos; `PS2X_VU_DIRECT_RANGE=<lo>-<hi>` e `PS2X_VU_DIRECT_LIMIT=<n>` restringem quais blocos/execuções rodam direto, para bisseção com o replay (o replay agora mostra o qword divergente).
+- **Erro antigo da referência achado pelos blocos**: quando a instrução de cima de um par tinha VF0 como destino (ex.: `ITOF0 vf0, vf9`), a de baixo do mesmo par lia o valor escrito em vez da constante (0,0,0,1). No hardware a escrita em VF0 é ignorada. Corrigido em `stepPair` e no laço de referência; 4 registros do `level00` mudaram (uma componente saía 32× maior num microprograma quente) e os traces foram regravados.
+
+| etapa | ns/par (5 programas quentes) |
+|---|---|
+| contabilidade por par reduzida + XGKICK em lote | 7,9 |
+| blocos diretos | 6,5 |
+
+(Com os 70 programas a etapa anterior aos blocos deu 6,34 ns/par; a medida com 5 programas inclui ~20% de pares interpretados.)
+
+## 120 fps: levantamento inicial de constantes de taxa (2026-10-09)
+
+O jogo é baseado em ticks: `func_0027F730(taxa)` grava `D_0040EBAC = 1/taxa` e os subsistemas recebem dt. Fora isso, o executável tem constantes imediatas que podem depender de 30 Hz e precisam ser auditadas uma a uma antes de mudar a taxa (varredura de pares `lui`/`ori`):
+
+- `1/30` (0x3D088889): 2 locais — 0x124FD4 (`func_00124E90`), 0x14081C (`func_001407C8`).
+- `30.0` (0x41F00000, só `lui`): 26 locais (primeiros: 0x100FB0, 0x10A1E0, 0x10A460, 0x129BA0, 0x13D0FC, 0x13FCE4, 0x17D8B8, 0x183EC4, 0x1894EC, 0x189DB4, 0x18DD98, 0x18DEE8); 6 palavras em dados.
+- `60.0` (0x42700000): 20 locais (0x101944, 0x101EB0, 0x10BD48, 0x1283CC, 0x129B98, 0x15878C…); 3 em dados.
+- `1/60`: 1 local (0x37C460, provavelmente dado).
+
+Nem todo `30.0`/`60.0` é taxa de quadros (podem ser ângulos, distâncias). O primeiro teste continua sendo taxa 60 com 2 atualizações por vblank.
+
+### Blocos diretos, versões 2 e 3 (2026-10-10)
+
+- **Stalls dentro do bloco**: a base de ciclos do bloco (`c`) é variável. Par com `hazardReads` testa `m_vfReady`/`m_viReady` em linha; par com `PairStall` testa FDIV/XGKICK em linha e só chama `waitPairStall()` quando precisa esperar. Depois de uma espera o bloco confere o orçamento de ciclos e, se não couber, sai antes do par (grava registradores, PC, estado do desvio pendente) e o motor interpretado continua.
+- **`m_hazardUnknown` dentro do bloco**: os quatro primeiros pares de cada bloco fazem a checagem completa (`waitHazardsOfPair`) enquanto o contador não zera. Sem isso, toda entrada de programa e todo retorno de `JR` mandava o trecho inteiro para o interpretador.
+- **Mais instruções**: DIV/SQRT/RSQRT (em linha, com confirmação rápida de Q em `D_commit`), CLIP, FCEQ/FCAND/FCOR/FCGET, ILW/ISW/ILWR/ISWR, MFP, XTOP/XITOP, XGKICK, WAITQ.
+- **Encadeamento e laços**: um bloco continua depois de um desvio condicional (saída lateral quando tomado); quando o destino é outro bloco da mesma função, salta direto (`goto`), e quando é o próprio início do bloco repete sem tirar os registradores das variáveis locais. O laço principal do Level_00 (0x630–0x758, 38 pares) vira um único laço nativo.
+- **XGKICK**: cópia em lote até o fim dos dados de cada GIFtag, na execução e no `flushPipelines()`.
+- Flags sob demanda: caminho rápido em `fzLaneFlags()` quando o resultado não tem expoente zero.
+
+| etapa (70 programas, trace `level00`) | ns/par | pares em blocos |
+|---|---|---|
+| antes dos blocos | 6,34 | 0% |
+| blocos v1 | 5,06 | — |
+| blocos v2 (stalls, mais instruções, XGKICK em lote) | 3,67 | 92,2% |
+| blocos v3 (saídas laterais, laços nativos) | 3,48 | 95,2% |
+| + clip flags sob demanda (`LazyClip`, `resolveLazyClip()`), CLIP em linha | 3,29 | 95,2% |
+
+A medida inclui ~0,5 ns/par de reposição da memória de dados feita pelo próprio replay. O console faz 3,39 ns/par. No perfil da v3 sobram: corpos dos blocos ~57%, resolução de flags em FMAND ~9%, fila de clip flags (`queueClip` + `commitReadyPipelines`) ~10%.
+
+Clip flags: no modo sob demanda, CLIP/FCSET gravam (ciclo em que sai do pipeline, novo valor) num anel de 8 e FCEQ/FCAND/FCOR/FCGET pegam o mais novo já pronto; `drainLazyFlags()` devolve os pendentes à fila ciclo a ciclo ao sair do modo.
+
+Próximo no VU: flags resolvidas na geração quando escritor e leitor estão no mesmo bloco, corpos dos blocos (registradores carregados/gravados por bloco), e depois os 120 fps propriamente ditos (taxa de ticks 60/120).
+
+## Taxa de ticks 60: primeiro experimento (2026-10-10)
+
+Como o jogo marca o tempo: `func_0027F730(taxa)` (30 em NTSC, 25 em PAL) grava `D_0040EBAC = 1/taxa` e `D_0040EBA8 = 1000/taxa`; `func_002B4DD0(n)` grava em `D_0040DF74` quantos vblanks cada quadro dura (2 no console) e o tratador de vblank escrito à mão em `0x2B2BA8` só apresenta quando o contador chega a esse valor.
+
+`BLACK_TICK_RATE=60` (`ps2recomp/overrides/black_tick_rate.cpp`, experimental, desligado por padrão) multiplica a taxa e divide o intervalo. Funciona: o jogo passa a fazer 60 atualizações por segundo de tempo do jogo. Mas o host não acompanha: no Level_00 o tempo do jogo anda a 0,5× (30 atualizações por segundo real), ou seja, o custo por atualização é ~33 ms e não há folga a 30.
+
+Perfil por thread (amostragem de 8–10 s no Level_00, `PS2X_VIF1_THREAD=1`, paraLLEl-GS):
+
+| | 30 ticks | 60 ticks |
+|---|---|---|
+| thread do jogo ocupada | 97% | 90% |
+| — dentro de `sub_002B32D8` (envia a lista e espera o DMA em laço) | 27% | 14% |
+| — código do jogo (EE) | 33% | 33% |
+| — VU0 | 13% | 16% |
+| — IOP | 18% | 14% |
+| — agendamento/despacho do EE | 21% | 13% |
+| thread VIF1/VU1 ocupada | 54% | 71% |
+
+A 60 ticks a thread do jogo gasta ~25 ms de trabalho real por atualização e a do VU ~23 ms; para 60 quadros por segundo as duas precisam ficar abaixo de 16,6 ms, e para 120, de 8,3 ms.
+
+Alvos na thread do jogo, por retorno esperado: VU0 (roda com flags imediatas e sem blocos diretos; `commitReadyPipelines` e `calculateFmacProductSticky` aparecem no topo), IOP em passo travado com o EE (`IopKernel::beginNextReady`, `runEeCycles`), agendamento do EE (`EeScheduler::checkpointDue`, `dispatchGuestBranch`, acesso a TLS, `advanceEeTimers`), e por fim a qualidade do código EE recompilado.
+
+## Rumo aos 60: medição limpa e gargalos fora da VU (2026-10-10, madrugada)
+
+**Medição limpa.** `ps2recomp/diagnostics/perf_run.py <tag> [VAR=valor ...]` roda o jogo com as configurações do launcher e sem ganchos de depuração, entra no Level_00 pelo script de controle, amostra o processo e imprime atualizações/s (`BLACK_FPS`), ocupação por thread (`sample_threads.py`) e em que cada thread espera (`sample_waits.py`). O `path3_gate_test.py` força `BLACK_DEBUG=1` e a captura do fluxo do GS, que aparecem como `ReadVram`, cópias e contenção de mutex: serve para validar imagem, não para medir.
+
+O que mudou e o efeito a 60 ticks (`BLACK_TICK_RATE=60`, Level_00, atualizações por segundo real):
+
+| mudança | atualizações/s |
+|---|---|
+| ponto de partida (VU1 v3) | 30 (jogo a 0,5×) |
+| VU0 com flags sob demanda e blocos diretos (`black_vu0_flags.cpp`, `PS2X_VU0_FLAGS_UNOBSERVED`) + contabilidade do EE em lotes de 128 ciclos (`PS2X_EE_ACCOUNT_BATCH`) + histórico de despacho opcional (`PS2X_DISPATCH_HISTORY=1`) | 31–42 |
+| 8 contextos de quadro no Granite (`PS2X_GS_FRAME_CONTEXTS`, era 2: a thread do GS parava a cada `flush` esperando a GPU) | 38–55 |
+| caminho rápido do UNPACK do VIF1 (sem máscara, modo 0, CL=WL) | 46–57 |
+
+- **VU0**: o EE do Black nunca lê status/MAC/clip do VU0 (nenhum CFC2 dos registradores 16–18 no executável). Com isso o VU0 usa o mesmo caminho do VU1: 95% dos pares em blocos, 24 → 10,5 ns/par no `vu0-session.bin`, 0 divergências. O gerador e a validação rodam com `PS2X_VU0_FLAGS_UNOBSERVED=1` (posto em `build_vu_recompiled.sh`); o runner liga o mesmo no início. O que sobra na VU0 é custo fixo por chamada (`m_vu0.reset()`, cópia do estado na ida e na volta).
+- **`sub_002B32D8`** não espera DMA: depois de enviar a lista ele fica em laço chamando o callback ocioso (`sub_001C4D00`) até o tratador de vblank trocar o quadro. A 30 ticks isso é folga, não trabalho.
+- **UNPACK**: `PS2X_VIF_UNPACK_VERIFY=1` roda o caminho rápido ao lado do laço geral e compara; 2,1 milhões de UNPACKs no Level_00, 0 diferentes.
+- **IOP**: o quantum padrão do runtime é 128 ciclos; o launcher usa 512. As medições antigas pelo harness inflavam a fatia do IOP.
+
+Continuação da mesma noite:
+
+| mudança | atualizações/s a 60 ticks |
+|---|---|
+| blocos: tempos de "pronto" gravados só na saída do bloco, ajuste de operando feito uma vez para registradores que o bloco não escreve (VU1 3,15 ns/par) | 47–58 |
+| despacho de chamadas do EE: `checkpointDueFast()` em linha, uma consulta à tabela e um acesso TLS por chamada | 51–57 |
+| UNPACK rápido também para STMOD 1/2 (soma de ROW) e para escrita com passo (WL=1, CL>1): 4,2 milhões verificados, 0 diferentes | 46–58, thread do VU1 de 99% para 86% |
+| `execute()` do VU só reinicia o agendador inteiro se sobrou algo pendente; `beginMicroCall()` na VU0 (VU1 2,96 ns/par, VU0 7,2 ns/par) | 53–57 |
+| trava do backend paraLLEl-GS solta durante a espera da cópia do scanout (ABI do módulo v6: `unlock`/`relock` em `GSParallelScanout`) | 56–60 na maior parte do percurso, ~48 num trecho pesado |
+
+Série típica de `BLACK_FPS` a 60 ticks (leituras de 2 s): menus 60,0 cravado; Level_00 56–60, com um trecho de ~8 s em 47–49 e volta a 60+. A 30 ticks: 30,0 cravado, sem as quedas para 27–28 que existiam no começo da noite.
+
+Achados que valem para a próxima etapa:
+- O perfil por endereço do `sample` (coluna `+ offset`) resolve o que o perfil por função esconde: foi assim que apareceu que o laço geral do UNPACK ainda rodava (STMOD e passo) depois do primeiro caminho rápido.
+- A 60 ticks, thread do jogo: ~46% código do EE (dos quais ~9% são o laço de espera do vblank), ~11% despacho, ~10% IOP, ~9% VU0, ~5% cópias do DMA. `PS2X_IOP_QUANTUM=2048` não mudou nada em relação a 512.
+- O Granite com 16 contextos de quadro não rende mais que com 8.
+- `PS2X_GS_NATIVE_PRESENT=1` não muda a taxa (a espera era a fila de contextos, não a leitura do scanout).
+
+### Alta resolução (`PS2X_GS_UPSCALE=2`): ainda com defeito (2026-10-10)
+
+As linhas do scanout agora são gravadas com o passo da própria imagem (`parallel_gs_module.cpp`), mas o defeito não era esse: a imagem 2560×1792 que o paraLLEl-GS devolve já mostra só o canto superior direito do quadro (160×112 pixels nativos), ampliado e repetido 4 vezes na horizontal. `PS2X_GS_SCANOUT_FLAGS=<máscara>` (1 `raw_circuit_scanout`, 2 `adapt_to_internal_horizontal_resolution`, 4 `internal_resolution_scanout`, 8 `anti_blur`) troca as opções de leitura: 0 e 2 dão quadro preto (1280×448 e 2560×448), 4, 5 e 6 dão o mesmo defeito. O próximo passo é comparar com o caminho de `high_resolution_scanout` do PCSX2 (patches em `recomp/gpu/parallel-gs/misc/`) e conferir `SMODE1/SMODE2` que passamos; `gs_renderer.cpp:4297` desliga o modo quando eles não batem com o esperado.
+
+### Fecho da madrugada de 2026-10-10
+
+- `runFast` liga arredondamento para zero e flush-to-zero com uma escrita de FPCR (sem `fesetround`); a cópia da lista de DMA reserva espaço pelo tamanho da anterior do mesmo canal.
+- Mesmo percurso com o script de controle a 30 e a 60 ticks (`path3_gate_test.py`, com e sem `EXTRA_BLACK_TICK_RATE=60`): o quadro final é o mesmo (mesma sala, mesma pose), com 3841 atualizações a 30 e 7261 a 60 no mesmo tempo de jogo. O movimento do jogador e a câmera, pelo menos, respeitam o dt.
+- Estado a 60 ticks no Level_00: 56–60 atualizações/s na maior parte do percurso e ~45–50 num trecho pesado. Ali o quadro passa pouco dos 16,6 ms, perde o vblank e espera um inteiro; faltam uns 10% na thread do jogo (EE ~40% de trabalho real + ~10% de laço de espera, IOP ~12%, despacho ~11%, VU0 ~8%).
+- VU1 2,94 ns/par, VU0 ~7–8 ns/par, 0 divergências nos dois traces.
+
+Candidatos para o que falta (nenhum é ajuste pequeno):
+1. IOP em thread própria (hoje executa dentro da thread do jogo, ~12% dela).
+2. Chamadas diretas entre funções do EE no código gerado, sem passar por `dispatchGuestBranch` (~9% entre a função e o acesso TLS). Precisa manter a tabela de funções por causa dos overrides.
+3. Espera do vblank bloqueante em vez do laço do jogo, e apresentação sem quantizar em vblanks inteiros (VRR).
+4. Para 120: a thread VIF1/VU1 está em ~87% a 60; dobrar a taxa exige dividir esse trabalho (por exemplo, VIF/UNPACK numa thread e VU1 em outra) ou reduzir o custo por par à metade.
+
+### Espera do vblank sem custo de host (2026-10-10, fim da madrugada)
+
+Teste que derrubou uma hipótese: `PS2X_EE_CYCLE_SCALE=50` (fator novo no agendador: multiplica os ciclos cobrados pelos checkpoints do código gerado; 100 por padrão) **piorou** o trecho pesado a 60 ticks (de ~47 para ~35 atualizações/s). Motivo: o laço em que o jogo espera o vblank (`sub_002B32D8` chamando `sub_001C4D00`) é emulado a mais ou menos 1× o tempo real, ou seja, esperar 1 ms de tempo de jogo custa ~1 ms de processador. Um quadro que termina cedo não dá folga nenhuma ao host, e em cena pesada o tempo de jogo fica abaixo do real.
+
+Correção: `ps2recomp/overrides/black_idle_wait.cpp` cobra 2000 ciclos de tempo ocioso do EE (`PS2Runtime::eeChargeIdleCycles`, não escalado) a cada chamada do callback ocioso; a espera chega ao vblank em poucas mil voltas e o agendador dorme até a hora do vblank no host. `BLACK_IDLE_WAIT=0` desliga, `BLACK_IDLE_WAIT_CYCLES=<n>` ajusta.
+
+| | antes | com a espera barata |
+|---|---|---|
+| 30 ticks: thread do jogo ocupada | 98% | 56% |
+| 30 ticks: atualizações/s | 30,0 | 30,0 |
+| 60 ticks: mínimo no trecho pesado | 45 | 51,5 |
+| 60 ticks: média no Level_00 | 56,4 | 57,2 |
+
+A 60 ticks, no trecho pesado, quem limita agora é a thread VIF1/VU1 (99%): programas da VU1 ~65% dela (espalhados por muitos blocos, não um laço só), resolução de flags ~7%, cópias de pacotes GIF ~6% (três cópias por pacote: XGKICK, árbitro, fila do GS), `GS::processGIFPacket` ~3%.
+
+### Cena pesada de referência e chamadas dentro dos blocos (2026-10-10, manhã)
+
+**Cena de referência.** O usuário achou um ponto do Level_00 (olhando pela janela lateral, 16:9) com ~117 mil primitivos por quadro, onde a thread VIF1/VU1 ficava em 99% mesmo a 30 ticks. Ficou salvo: `recomp/diagnostics/perf/heavy-spot.ram` (posição; `POSE=<arquivo>` em `perf_run.py` e `soak_run.py` teleporta o jogador para lá com `BLACK_POSE_REF`) e `recomp/diagnostics/vu-trace/heavy-spot.bin` (3000 chamadas da VU1, 1 a cada 20, 4,2 milhões de pares). O percurso do script de controle é leve demais para servir de medida.
+
+**Chamadas dentro de blocos custam caro.** Um bloco mantém ~25 registradores vetoriais vivos; qualquer chamada de função dentro dele faz o compilador salvar e recarregar todos (no AArch64 os registradores NEON são do chamador). O perfil por endereço mostrava as amostras concentradas logo depois de cada `bl`. Passaram a ser resolvidos em linha, sem chamada no caminho comum:
+- leitura de MAC (`D_mac`): acha o registro mais novo já pronto e tira Z/S do resultado NEON; só chama o caminho exato quando uma componente zero pode ser underflow. Também trata em linha o caso de mais de 8 resultados gravados sem leitura, que era o comum e fazia tudo cair no caminho lento;
+- confirmação de Q (`D_commit`);
+- leitura de clip flags (`D_clipFlags`);
+- espera de hazard sem nada pendente no intervalo (só move a base de ciclos).
+
+| trace | antes | depois |
+|---|---|---|
+| `heavy-spot` (VU1) | 3,04 ns/par | 2,23 |
+| `level00` (VU1) | 2,94 | 2,23 |
+| `vu0-session` | ~7,2 | ~5,4–6,8 (medida ruidosa) |
+
+No jogo, no ponto pesado: a 30 ticks, 30 cravado com a thread do VU1 em 60% (era 99% e caía para 25); a 60 ticks, ~36 atualizações/s (era ~33), com VU1 em 84% e a thread do jogo em 76%. O limite ali passou a ser o GS: a thread do paraLLEl-GS fica 69% ocupada montando primitivos (`packed_STQRGBAXYZ`, `drawing_kick`) e o resto esperando a GPU; a VU1 espera 15% em `feedAppend` e o jogo 22% esperando a VU1.
+
+**Congelamento em aberto.** Duas vezes em jogo real (não reproduzido em 12 minutos de `soak_run.py`): `qsort` (0x35EC50), chamado por `0x1AF298` para ordenar um balde da fila de renderização (`[D_0040F4C0]+0x14+0xCA58+k*24`: itens, vetor de ordenação, contagem, capacidade, índice, comparador), recebe base e comparador inválidos (0x02D402A9; 0x7800E802). A função que adiciona itens (0x1AF1C0) confere a capacidade, então o cabeçalho do balde foi sobrescrito por outra coisa. O launcher agora grava `recomp/diagnostics/fault.ram` e o histórico de chamadas quando isso acontecer (`PS2X_FAULT_RAM_DUMP`, `PS2X_DISPATCH_HISTORY=1`). Logs: `recomp/diagnostics/freeze*-2026-10-10.log`.
+
+### Renderizador nativo do GS — fase 0 e primeira versão da fase 1 (2026-10-10)
+
+Plano, decisões e andamento em `ps2recomp/GS_NATIVE_RENDERER_PLAN.md`. Resumo: dump reproduzível de GS no módulo paraLLEl (`PS2X_GS_DUMP*`), ferramenta `gs-replay` (replay em qualquer módulo + comparação de quadros), captura de referência `recomp/diagnostics/gs-dump/heavy.gsdump` (119/120 scanouts idênticos ao jogo no paraLLEl), e módulo Metal `ps2recomp/gpu/native/` (`libblack-native-gs.so`, mesma ABI) que já desenha a cena no alvo principal; a imagem final ainda sai errada por causa do pós-processamento (fase 3). Não é padrão em lugar nenhum; o launcher continua no paraLLEl-GS. `gs_feature_census.py` agora lê dumps (eventos de registrador e de scanout) e teve os endereços de DTHE/COLCLAMP corrigidos.
+
+### Congelamento em jogo: causa raiz encontrada (2026-10-10)
+
+O congelamento aleatório (`qsort` saltando para um ponteiro de comparação inválido na fila de desenho) era um erro do tradutor da EE: `BLTZ/BGEZ/BLEZ/BGTZ` (e as formas likely/link) eram emitidos testando só os 32 bits baixos (`GPR_S32`), e o R5900 testa o registrador de 64 bits inteiro. `func_0028A688` (preenchimento por inundação de um grafo, chamada por `func_0028AFF8` ← `func_00289F78` ← `func_00175750`) lê uma máscara de 64 bits e desvia com `bltz` (bit 63); com o teste errado a travessia reempilhava os mesmos nós para sempre, a pilha interna de 2.500 entradas (objeto em `0x4CBB50`, pilha em `+0x210`, ponteiro em `+0x1598`, sem checagem) estourava, sobrescrevia o próprio ponteiro e passava a escrever sobre a tabela de baldes em `[D_0040F4C0]+0x14+0xCA58`.
+
+Como foi achado: `BLACK_WATCH=1` no launcher roda o jogo sob lldb com `ps2recomp/diagnostics/watch_bucket.py`, que arma um ponto de vigia de hardware em um campo da tabela quando `func_001AF580` a inicializa e registra a pilha de chamadas (os nomes `sub_XXXXXXXX` dão a função do jogo) e a RAM no momento da escrita. Não custa desempenho e o lldb não pede senha para binários locais.
+
+Correção: `ps2xRecomp/src/lib/control_flow_emitter.cpp` passa a emitir `GPR_S64`; os 1.417 arquivos gerados com esses desvios (2.780 pontos) receberam a mesma troca por `sed`, equivalente a regenerar. Vale conferir de novo os sintomas antigos de comportamento (camada de detalhe faltando, diferenças de fila contra o PCSX2), que podem ter a mesma origem.

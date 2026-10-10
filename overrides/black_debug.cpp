@@ -474,7 +474,9 @@ namespace
             char path[64];
             // BLACK_FRAME_KEEP=N guarda os N primeiros dumps em sequencia (padrao: ring de 4).
             static const int s_keep = std::getenv("BLACK_FRAME_KEEP") ? std::atoi(std::getenv("BLACK_FRAME_KEEP")) : 0;
-            std::snprintf(path, sizeof(path), "/tmp/black_frame_%d.ppm", s_keep > 0 ? std::min(s_dump++, s_keep - 1) : s_dump++ % 4);
+            // BLACK_FRAME_RING=N: tamanho do ring (com BLACK_DUMP_EVERY pequeno, da uma sequencia de quadros).
+            static const int s_ring = std::getenv("BLACK_FRAME_RING") ? std::max(1, std::atoi(std::getenv("BLACK_FRAME_RING"))) : 4;
+            std::snprintf(path, sizeof(path), "/tmp/black_frame_%d.ppm", s_keep > 0 ? std::min(s_dump++, s_keep - 1) : s_dump++ % s_ring);
             if (FILE *f = std::fopen(path, "wb"))
             {
                 std::fprintf(f, "P6\n%u %u\n255\n", w, hgt);
@@ -852,7 +854,10 @@ namespace
         if (!g_watchArmed && (s_customWatch ? cur != 0u : cur == 0x00410000u))
         {
             g_watchArmed = true;
-            std::fprintf(stderr, "[black-watch] armado em pc=0x%06x valor=0x%08x\n", pc, cur);
+            std::fprintf(stderr, "[black-watch] armado em pc=0x%06x valor=0x%08x ra=0x%08x hist:", pc, cur, reg(ctx, 31));
+            for (unsigned i = 0; i < 16; ++i)
+                std::fprintf(stderr, " %06x", g_pcHistory[(g_pcHistoryPos + i) & 15u]);
+            std::fprintf(stderr, "\n");
         }
         else if (g_watchArmed && cur != g_watchLast && g_watchReports < (s_customWatch ? 20u : 6u))
         {

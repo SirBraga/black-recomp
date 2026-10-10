@@ -31,3 +31,18 @@ target_include_directories(black-parallel-texture-test PRIVATE "${RUNTIME_INCLUD
 # CPU swizzle tables provide an independent layout oracle for format reinterpretation.
 target_sources(black-parallel-texture-test PRIVATE "${RUNTIME_INCLUDE}/../src/lib/gs/ps2_gs_memory.cpp")
 set_property(TARGET black-parallel-texture-test PROPERTY CXX_STANDARD 20)
+
+# Replays a GS dump through any renderer module with this ABI and compares the frames (diagnostics/gs_replay.cpp).
+add_executable(gs-replay ../diagnostics/gs_replay.cpp)
+target_include_directories(gs-replay PRIVATE "${RUNTIME_INCLUDE}")
+
+# Native renderer: GS draw state translated to Metal draw calls (native/native_gs_module.mm). Same module ABI.
+if(APPLE)
+ add_library(black-native-gs MODULE native/native_gs_module.mm "${RUNTIME_INCLUDE}/../src/lib/gs/ps2_gs_memory.cpp")
+ target_include_directories(black-native-gs PRIVATE "${RUNTIME_INCLUDE}" native)
+ target_compile_options(black-native-gs PRIVATE -fobjc-arc)
+ set_property(TARGET black-native-gs PROPERTY CXX_STANDARD 20)
+ set_property(TARGET black-native-gs PROPERTY OBJCXX_STANDARD 20)
+ set_target_properties(black-native-gs PROPERTIES PREFIX "lib" SUFFIX ".so")
+ target_link_libraries(black-native-gs PRIVATE "-framework Metal" "-framework Cocoa" "-framework QuartzCore")
+endif()
