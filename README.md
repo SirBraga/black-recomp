@@ -16,26 +16,40 @@ Só funciona no macOS com Apple Silicon (testei num M1 Pro).
 
 ## Até onde chegou
 
-- O jogo abre, passa pelo menu, toca os vídeos e chega na primeira fase (Level_00).
-- **Texturas certas,** na introdução e na jogabilidade. Eram dois bugs: a ordem dos uploads de textura e um estouro da lista de DMA do próprio jogo.
+- O jogo abre, passa pelo menu, toca os vídeos e chega na primeira fase (Level_00). Já dá pra andar pelas ruas de Veblensk (a foto aí em cima).
+- **A sala do começo tá inteira.** As paredes, o teto e as janelas que sumiam eram o VF0 zerado nas threads secundárias. Corrigido, e o jogador não fica mais preso.
+- **Geometria que sumia conforme a câmera também foi resolvida.** Era o arredondamento do EE (o PS2 trunca) e uns stalls de pipeline da VU que faltavam.
 - **Nada do console é interpretado no caminho normal:** EE, VU0, VU1 e IOP rodam recompilados.
-- **O microcódigo da VU sai direto do executável.** Os 70 microprogramas são extraídos do seu ELF e recompilados na hora do build, então não precisa jogar pra capturar nada. Nada disso vem no repo. No replay dos traces gravados deu 0 divergências.
-- **Bug da FPU achado:** o recompilador traduzia o `sqrt.s` errado (e mais três coisas da FPU). Com isso corrigido, o jogador nasce dentro da sala, a arma aparece no lugar certo e os "espetos pretos" sumiram.
-- **~30 updates/s no spawn do Level_00** (antes ~21). Parte disso pode ser porque o prédio ainda não é desenhado (veja abaixo).
-- Gráficos via paraLLEl-GS (Vulkan em cima do MoltenVK), ou SDL_GPU + Metal se o módulo não estiver compilado. VIF1/VU1 rodam numa thread própria.
-- Dá pra pular vídeo com Tab ou Select. Teclado e controle funcionam (veja [CONTROLES.md](CONTROLES.md)).
+- **A VU1 já é mais rápida que a do PS2.** Os microprogramas viram blocos NEON nativos (~95% dos pares de instrução rodam assim). No replay de traces gravados do jogo dá ~2,2–2,3 ns por par, contra ~3,4 ns no chip de verdade, ou seja, ~1,5× mais rápida que o console, com 0 divergências contra a referência.
+- A VU0 usa o mesmo esquema e caiu pra ~5–7 ns por par. Ainda é mais lenta que o hardware, mas é só uns 8% da thread do jogo.
+- O microcódigo da VU sai direto do seu ELF na hora do build. Nada disso vem no repo.
+- **60 fps tá perto.** Com `BLACK_TICK_RATE=60` (experimental, desligado por padrão) o jogo roda a 60 atualizações por segundo. No percurso do Level_00 fica em 56–60 a maior parte do tempo. A 30 fica cravado em 30.
+- O que ajudou a chegar aí: espera do vblank sem gastar CPU, UNPACK do VIF1 mais rápido, 8 contextos de quadro no Granite (paraLLEl-GS) e as otimizações da VU.
+- **Num ponto bem pesado** (olhando pela janela, ~117 mil primitivos por quadro) cai pra ~36 a 60 ticks. Ali quem segura agora é o GS (paraLLEl-GS montando primitivos), não a VU.
+- **Renderizador nativo em Metal começando** (`gpu/native/`). Já desenha a cena, mas a imagem final ainda sai errada. Não é o padrão; o launcher continua no paraLLEl-GS.
+- 16:9 com `BLACK_WIDESCREEN=1`. Dá pra pular vídeo com Tab ou Select. Teclado e controle funcionam (veja [CONTROLES.md](CONTROLES.md)).
 
 ## O que falta
 
 Ainda não dá pra jogar de verdade.
 
-- **O prédio da sala não aparece:** paredes, teto e janelas somem e dá pra ver o céu atrás da mesa. Acontece igual com a VU de referência, então a suspeita é o teste de visibilidade do lado do EE. Tô investigando.
-- **A VU1 ainda é a parte mais pesada:** ~9 ns por par de instruções. O código é recompilado, mas ainda gera um passo por par, sem gerar por bloco.
-- **Talvez a gente desenhe demais:** ~4.300 draws por quadro no spawn contra 2.364 num dump do PCSX2. Só dá pra comparar direito quando as duas imagens baterem.
-- O IOP recompilado não ficou mais rápido e ainda não tem teste instrução por instrução.
-- Tudo isso só foi testado no Level_00.
+- **Travamento raro:** duas vezes o jogo congelou num `qsort` da fila de desenho (o cabeçalho de um balde é sobrescrito por algo). Não consegui reproduzir ainda.
+- Chão liso ou com buracos perto da porta da sala inicial. Ainda investigando.
+- Às vezes uma abertura de arquivo falha sem motivo (parece corrida entre threads).
+- Alta resolução (`PS2X_GS_UPSCALE`) ainda sai com defeito.
+- Só testei o começo do jogo (Level_00 / Veblensk).
+
+## Próximos passos
+
+- Terminar o renderizador Metal do GS, que agora é o gargalo.
+- VU de "alto nível" de verdade: resolver o timing na hora de gerar o código, uma função por microprograma e cobrir o resto dos pares. Isso inclui melhorar a VU0.
+- Dividir o VIF1/VU1 em mais threads (pra 120 fps).
+- Testar o jogo inteiro.
+- Um `setup.sh` pra montar tudo de uma vez.
 
 Os detalhes técnicos de verdade estão em [PS2_PROJECT_STATE.md](PS2_PROJECT_STATE.md).
+
+> **Aviso:** parte do que tá descrito aqui (blocos NEON da VU, overrides de 60 ticks, espera do vblank, renderizador Metal) ainda tá só na minha máquina e não foi pro repo. O código e o patch daqui são do último push.
 
 ## Como rodar
 
