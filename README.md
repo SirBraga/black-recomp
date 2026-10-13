@@ -20,7 +20,7 @@ Só funciona no macOS com Apple Silicon (testei num M1 Pro).
 
 | pedaço da meta | peso | onde tá | por quê |
 |---|---|---|---|
-| Rodar sem travar nem corromper | 25% | ~80% | O congelamento aleatório foi achado e corrigido (era um desvio de 64 bits traduzido errado). Ainda tem a abertura de arquivo que falha às vezes e só o começo do jogo foi testado. |
+| Rodar sem travar nem corromper | 25% | ~80% | O congelamento aleatório foi achado e corrigido (era um desvio de 64 bits traduzido errado). A falha esporádica de abertura de arquivo não reproduz mais. |
 | Gráfico bom | 25% | ~75% | O renderizador Metal é o padrão, bate com a referência (0,01–0,22% de pixels diferentes) e roda em 3× com 16:9. Fumaça, fogo e brilho foram corrigidos. Falta o reflexo das armas, que aparece com triângulos brancos (bug em aberto, antes do GS). |
 | 60 fps de verdade | 25% | ~85% | 60 ticks é o padrão (o jogo gera 60 quadros, não acelera). Os quadros são apresentados no flip do próprio jogo e o vblank do jogo segue a tela (CVDisplayLink, 120 Hz → um vblank a cada 2 atualizações da tela): nas medições de jogo, 0 quadros atrasados na tela. A GPU leva ~8 ms por quadro em 3× no ponto pesado (0 de 120 acima de 16 ms). Falta revisar as poucas constantes do jogo que assumem 30 Hz e medir nas outras fases. |
 | Jogo inteiro, som, save | 25% | ~65% | O jogo roda bem além do Level_00 (~80%), som funcionando (SPU2 sintetizado, com reverb), mouse e teclado como num FPS de PC. Memory card ainda não foi testado. |
@@ -36,12 +36,12 @@ Chute meu, com base no que já foi testado. Não é uma métrica oficial.
 | EE (CPU principal) | ~88% | Roda o Level_00 inteiro. 2.557 instruções do jogo testadas contra um modelo independente, 0 diferenças. O travamento era daqui (`bltz/bgez/blez/bgtz` testavam 32 bits em vez de 64) e foi corrigido. Faltam algumas instruções sem teste. |
 | VU1 | ~88% | 99,9% dos pares em blocos NEON nativos, 1,6–1,7 ns por par nos traces gravados (~2× o PS2, medido sem o custo do próprio banco de teste), 0 divergências. Código gerado em 8 arquivos, com superblocos guiados por perfil dos traces. A meta de 1,5 ns ainda não foi atingida; dividir entre núcleos só com execução especulativa (medido, não feito). |
 | VU0 | ~88% | Mesmo gerador da VU1, 99,7% dos pares em código direto, ~1,5–2,3 ns por par contra 3,39 ns do console. No modo macro (instruções COP2 dentro do código do EE) foram corrigidas `VDIV/VSQRT/VRSQRT`, `VFTOI` (estourava para negativo em vez de saturar) e `VMAX/VMINI` (agora comparam como a VU, bit a bit). |
-| IOP | ~80% | Recompilado, roda em thread própria por padrão (tira ~12% da thread do jogo). Não tem teste instrução por instrução. |
+| IOP | ~95% | Os 10 módulos que o jogo carrega estão recompilados (nenhum módulo novo apareceu jogando além do Level_00). A CPU passa num teste diferencial contra um modelo independente do R3000: 8.257 instruções distintas dos módulos, 0 diferenças, incluindo o load delay (corrigido o `LWL`/`LWR`, usado pelos drivers de controle e memory card). Roda em thread própria. Falta testar salvar/carregar. |
 | GS com paraLLEl-GS (referência) | ~85% | Texturas e imagem certas; usado como referência pra validar o Metal (`BLACK_GS=parallel`). Lento no ponto mais pesado. |
 | GS nativo em Metal (padrão) | ~85% | Bate com o paraLLEl-GS em 6 dumps (0–0,22% de pixels diferentes). Desenha direto na janela, sincronizado com a tela, de 1× a 8× de resolução interna; shaders especializados por estado (3×: ~4,4 ms por quadro no replay). |
 | Vídeos (FMV) | ~85% | Tocam e dá pra pular. |
 | Controle | ~90% | Controle, teclado e mouse funcionam juntos. O mouse gira a câmera direto no ângulo do jogador (sem a aceleração do analógico), como num FPS de PC. |
-| Disco/arquivos | ~75% | Carrega tudo do disco, mas às vezes uma abertura de arquivo falha. |
+| Disco/arquivos | ~95% | Carrega tudo do disco. A falha esporádica de abertura de arquivo não reproduz mais (4 boots, ~240 aberturas, nenhuma falha); `BLACK_DEBUG=1` registra cada abertura (`[black-fs]`) se voltar. |
 | Áudio | ~70% | O SPU2 agora sintetiza o som de verdade: ADPCM, interpolação gaussiana do hardware, envelopes, volumes, reverb, a entrada de PCM que o driver do jogo mistura no IOP e a saída de cada núcleo na RAM de som. Vozes, rádio e recargas ok; os tiros ainda saem um pouco abafados comparando com o PCSX2. |
 | Memory card/save | ? | Passa pelo aviso do memory card, salvar ainda não foi testado. |
 | 60 fps | ~85% | 60 constante no Level_00, inclusive no ponto pesado e nas explosões (as quedas vinham de cópias de alvo na GPU e da apresentação fora do flip, ambas corrigidas). Thread do jogo em ~22% no ponto pesado. Falta revisar o que no jogo assume 30 Hz e testar as outras fases. |
@@ -84,7 +84,6 @@ Ainda não dá pra jogar de verdade.
 - Tradução: sem acentos, revisão em curso, e só o começo do jogo foi visto em português.
 - As correções dos desvios de 64 bits e da divisão da VU0 mexem na lógica do jogo inteiro: falta rever jogando os sintomas antigos de comportamento (chão perto da porta, objetos que faltavam).
 - Chão liso ou com buracos perto da porta da sala inicial. Ainda investigando.
-- Às vezes uma abertura de arquivo falha sem motivo (parece corrida entre threads).
 - Alta resolução no paraLLEl-GS continua quebrada (no Metal, que é o padrão, funciona).
 
 ## Próximos passos
