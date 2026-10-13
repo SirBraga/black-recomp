@@ -16,16 +16,16 @@ Só funciona no macOS com Apple Silicon (testei num M1 Pro).
 
 ## Quanto falta pra ser um recomp bom de jogar
 
-**Leitura de hoje (2026-10-13): uns 60%.** A meta é jogar o Black no PC com gráfico bom e 60 fps de verdade (o jogo gerando 60 quadros, não acelerado). É um chute, mas é assim que eu chego nele:
+**Leitura de hoje (2026-10-13): uns 72%.** A meta é jogar o Black no PC com gráfico bom e 60 fps de verdade (o jogo gerando 60 quadros, não acelerado). É um chute, mas é assim que eu chego nele:
 
 | pedaço da meta | peso | onde tá | por quê |
 |---|---|---|---|
 | Rodar sem travar nem corromper | 25% | ~80% | O congelamento aleatório foi achado e corrigido (era um desvio de 64 bits traduzido errado). Ainda tem a abertura de arquivo que falha às vezes e só o começo do jogo foi testado. |
 | Gráfico bom | 25% | ~75% | O renderizador Metal é o padrão, bate com a referência (0,01–0,22% de pixels diferentes) e roda em 3× com 16:9. Fumaça, fogo e brilho foram corrigidos. Falta o reflexo das armas, que aparece com triângulos brancos (bug em aberto, antes do GS). |
 | 60 fps de verdade | 25% | ~85% | 60 ticks é o padrão (o jogo gera 60 quadros, não acelera). Os quadros são apresentados no flip do próprio jogo e o vblank do jogo segue a tela (CVDisplayLink, 120 Hz → um vblank a cada 2 atualizações da tela): nas medições de jogo, 0 quadros atrasados na tela. A GPU leva ~8 ms por quadro em 3× no ponto pesado (0 de 120 acima de 16 ms). Falta revisar as poucas constantes do jogo que assumem 30 Hz e medir nas outras fases. |
-| Jogo inteiro, som, save | 25% | ~25% | Som funcionando (SPU2 sintetizado, com reverb), mouse e teclado como num FPS de PC. Só o Level_00 foi testado; memory card ainda não. |
+| Jogo inteiro, som, save | 25% | ~65% | O jogo roda bem além do Level_00 (~80%), som funcionando (SPU2 sintetizado, com reverb), mouse e teclado como num FPS de PC. Memory card ainda não foi testado. |
 
-Somando com os pesos dá ~66%; eu puxo pra ~60% porque a última linha é a mais incerta (ninguém jogou depois da primeira fase) e porque só roda em Mac com Apple Silicon. O que mais mexe nesse número é jogar as outras fases.
+Somando com os pesos dá ~76%; eu puxo pra ~72% porque ainda há bugs em aberto (reflexo das armas, tiros abafados), o save não foi testado e só roda em Mac com Apple Silicon.
 
 ## Progresso por parte
 
@@ -46,7 +46,7 @@ Chute meu, com base no que já foi testado. Não é uma métrica oficial.
 | Memory card/save | ? | Passa pelo aviso do memory card, salvar ainda não foi testado. |
 | 60 fps | ~85% | 60 constante no Level_00, inclusive no ponto pesado e nas explosões (as quedas vinham de cópias de alvo na GPU e da apresentação fora do flip, ambas corrigidas). Thread do jogo em ~22% no ponto pesado. Falta revisar o que no jogo assume 30 Hz e testar as outras fases. |
 | Tradução pt-BR | em andamento | Os textos do jogo (`MAINUS.BIN`, 1.716 entradas) têm uma versão em português, sem acentos por enquanto (a fonte do jogo só tem ASCII). O launcher abre em português por padrão. Revisão do texto ainda em curso; só foi testada no começo do jogo. |
-| Jogo inteiro | ~5% | Só testei o começo (Level_00 / Veblensk). |
+| Jogo inteiro | ~80% | O jogo roda bem além do Level_00 (avaliação jogando). Falta fechar os bugs em aberto e testar o save. |
 
 ## Até onde chegou
 
@@ -86,7 +86,6 @@ Ainda não dá pra jogar de verdade.
 - Chão liso ou com buracos perto da porta da sala inicial. Ainda investigando.
 - Às vezes uma abertura de arquivo falha sem motivo (parece corrida entre threads).
 - Alta resolução no paraLLEl-GS continua quebrada (no Metal, que é o padrão, funciona).
-- Só testei o começo do jogo (Level_00 / Veblensk).
 
 ## Próximos passos
 
