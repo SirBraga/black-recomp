@@ -115,7 +115,18 @@ int main()
             }
             state.vf[0][3] = 1.0f;
 
-            op.run(nullptr, &ctx, nullptr);
+            // The game thread runs guest code in the VU's floating-point mode (round toward zero, flush to zero);
+            // run the macro code the same way, or every multiply-add differs from the VU by rounding alone.
+            {
+#if defined(__aarch64__)
+                const uint64_t fpcr = __builtin_arm_rsr64("FPCR");
+                __builtin_arm_wsr64("FPCR", (fpcr & ~(3ull << 22)) | (3ull << 22) | (1ull << 24));
+                op.run(nullptr, &ctx, nullptr);
+                __builtin_arm_wsr64("FPCR", fpcr);
+#else
+                op.run(nullptr, &ctx, nullptr);
+#endif
+            }
 
             vu.state() = state;
             vu.prepareReplay(state);

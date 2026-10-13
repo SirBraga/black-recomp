@@ -45,6 +45,7 @@ namespace
     {
         uint64_t lo64[32]{}, hi64[32]{};
         uint64_t hi = 0, lo = 0, hi1 = 0, lo1 = 0;
+        uint32_t sa = 0; // shift amount register, in bits (as the runtime keeps it: MTSAB/MTSAH scale it)
         uint32_t f[32]{};
         uint32_t acc = 0;
         bool cond = false;
@@ -178,6 +179,8 @@ namespace
             case 0x27: set64(r, rd, ~(g64(r, rs) | g64(r, rt))); return true;
             case 0x2A: set64(r, rd, static_cast<int64_t>(g64(r, rs)) < static_cast<int64_t>(g64(r, rt)) ? 1 : 0); return true;
             case 0x2B: set64(r, rd, g64(r, rs) < g64(r, rt) ? 1 : 0); return true;
+            case 0x28: set64(r, rd, r.sa); return true;                // MFSA
+            case 0x29: r.sa = g32(r, rs) & 0x7Fu; return true;          // MTSA
             case 0x2C: { int64_t v; if (!__builtin_add_overflow(static_cast<int64_t>(g64(r, rs)), static_cast<int64_t>(g64(r, rt)), &v)) set64(r, rd, static_cast<uint64_t>(v)); return true; }
             case 0x2D: set64(r, rd, g64(r, rs) + g64(r, rt)); return true;
             case 0x2E: { int64_t v; if (!__builtin_sub_overflow(static_cast<int64_t>(g64(r, rs)), static_cast<int64_t>(g64(r, rt)), &v)) set64(r, rd, static_cast<uint64_t>(v)); return true; }
@@ -190,6 +193,10 @@ namespace
             case 0x3F: set64(r, rd, static_cast<uint64_t>(static_cast<int64_t>(g64(r, rt)) >> (sa + 32u))); return true;
             default: return false;
             }
+        case 0x01: // REGIMM: only MTSAB/MTSAH here (the branches are not tested)
+            if (rt == 0x18u) { r.sa = ((g32(r, rs) ^ uimm) & 0xFu) << 3; return true; }
+            if (rt == 0x19u) { r.sa = ((g32(r, rs) ^ uimm) & 0x7u) << 4; return true; }
+            return false;
         case 0x08: { int32_t v; if (!__builtin_add_overflow(static_cast<int32_t>(g32(r, rs)), simm, &v)) set64(r, rt, sext32(static_cast<uint32_t>(v))); return true; }
         case 0x09: set64(r, rt, sext32(g32(r, rs) + static_cast<uint32_t>(simm))); return true;
         case 0x0A: set64(r, rt, static_cast<int64_t>(g64(r, rs)) < static_cast<int64_t>(simm) ? 1 : 0); return true;
@@ -259,6 +266,15 @@ namespace
                 case 0x12: d.setW(0, b.w(2)); d.setW(1, a.w(2)); d.setW(2, b.w(3)); d.setW(3, a.w(3)); break;
                 case 0x16: for (int i = 0; i < 4; ++i) { d.setH(2 * i, b.h(i + 4)); d.setH(2 * i + 1, a.h(i + 4)); } break;
                 case 0x1A: for (int i = 0; i < 8; ++i) { d.setB(2 * i, b.b(i + 8)); d.setB(2 * i + 1, a.b(i + 8)); } break;
+                case 0x1B: // QFSRV: the 256-bit rs:rt shifted right by SA bits, low 128 bits
+                {
+                    const unsigned __int128 hiPart = (static_cast<unsigned __int128>(a.q[1]) << 64) | a.q[0];
+                    const unsigned __int128 loPart = (static_cast<unsigned __int128>(b.q[1]) << 64) | b.q[0];
+                    const uint32_t s = r.sa & 0x7Fu;
+                    const unsigned __int128 v = s == 0u ? loPart : ((loPart >> s) | (hiPart << (128u - s)));
+                    d.q[0] = static_cast<uint64_t>(v); d.q[1] = static_cast<uint64_t>(v >> 64);
+                    break;
+                }
                 default: return false;
                 }
                 setVec(r, rd, d);
@@ -276,6 +292,16 @@ namespace
                 case 0x12: d.q[0] = a.q[0] & b.q[0]; d.q[1] = a.q[1] & b.q[1]; break;
                 case 0x13: d.q[0] = a.q[0] ^ b.q[0]; d.q[1] = a.q[1] ^ b.q[1]; break;
                 case 0x1F: d.setW(0, b.w(1)); d.setW(1, b.w(2)); d.setW(2, b.w(0)); d.setW(3, b.w(3)); break;
+                case 0x1C: // PMULTH: eight separate products; LO = p0 p1 p4 p5, HI = p2 p3 p6 p7, rd = p0 p2 p4 p6
+                {
+                    uint32_t p[8];
+                    for (int i = 0; i < 8; ++i)
+                        p[i] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(a.h(i))) * static_cast<int32_t>(static_cast<int16_t>(b.h(i))));
+                    r.lo = uint64_t(p[0]) | (uint64_t(p[1]) << 32); r.lo1 = uint64_t(p[4]) | (uint64_t(p[5]) << 32);
+                    r.hi = uint64_t(p[2]) | (uint64_t(p[3]) << 32); r.hi1 = uint64_t(p[6]) | (uint64_t(p[7]) << 32);
+                    d.setW(0, p[0]); d.setW(1, p[2]); d.setW(2, p[4]); d.setW(3, p[6]);
+                    break;
+                }
                 default: return false;
                 }
                 setVec(r, rd, d);
@@ -560,6 +586,7 @@ int main()
             ref.lo = sext32(static_cast<uint32_t>(rng()));
             ref.hi1 = sext32(static_cast<uint32_t>(rng()));
             ref.lo1 = sext32(static_cast<uint32_t>(rng()));
+            ref.sa = (rng() % 16u) * 8u;
             for (uint32_t &f : ref.f)
                 f = randomFloat();
             ref.acc = randomFloat();
@@ -575,6 +602,7 @@ int main()
             for (int reg = 1; reg < 32; ++reg)
                 ctx.r[reg] = _mm_set_epi64x(static_cast<int64_t>(ref.hi64[reg]), static_cast<int64_t>(ref.lo64[reg]));
             ctx.hi = ref.hi; ctx.lo = ref.lo; ctx.hi1 = ref.hi1; ctx.lo1 = ref.lo1;
+            ctx.sa = ref.sa;
             for (int reg = 0; reg < 32; ++reg)
                 std::memcpy(&ctx.f[reg], &ref.f[reg], 4);
             std::memcpy(&ctx.f_acc, &ref.acc, 4);
@@ -600,7 +628,7 @@ int main()
                 }
             }
             const struct { const char *name; uint64_t got, want; } wide[] = {
-                {"hi", ctx.hi, ref.hi}, {"lo", ctx.lo, ref.lo}, {"hi1", ctx.hi1, ref.hi1}, {"lo1", ctx.lo1, ref.lo1}};
+                {"hi", ctx.hi, ref.hi}, {"lo", ctx.lo, ref.lo}, {"hi1", ctx.hi1, ref.hi1}, {"lo1", ctx.lo1, ref.lo1}, {"sa", ctx.sa, ref.sa}};
             for (const auto &w : wide)
                 if (!opFailed && w.got != w.want)
                 {

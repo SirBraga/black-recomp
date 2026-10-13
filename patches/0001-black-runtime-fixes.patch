@@ -557,10 +557,10 @@ index f236050..8a2d922 100644
      private:
 diff --git a/ps2xIOP/src/emulator/core/iop_cpu_exec.inl b/ps2xIOP/src/emulator/core/iop_cpu_exec.inl
 new file mode 100644
-index 0000000..7d49f32
+index 0000000..8b26802
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/core/iop_cpu_exec.inl
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,472 @@
 +// Instruction bodies of the IOP CPU core, shared by the interpreter and the recompiled module code.
 +#pragma once
 +#include "iop_cpu.h"
@@ -892,7 +892,9 @@ index 0000000..7d49f32
 +        {
 +            const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
 +            const uint32_t memory = m_memory.read32(address & ~3u);
-+            const uint32_t old = cpu.gpr[rt];
++            // LWL/LWR merge with the value a load in the previous instruction is still delivering to rt (the
++            // R3000 forwards it for exactly this pairing: "lwl rt / lwr rt" reads one unaligned word).
++            const uint32_t old = cpu.pendingLoad && cpu.pendingLoadReg == rt ? cpu.pendingLoadValue : cpu.gpr[rt];
 +            static constexpr uint32_t masks[4] = {0x00FFFFFFu, 0x0000FFFFu, 0x000000FFu, 0x00000000u};
 +            static constexpr uint32_t shifts[4] = {24u, 16u, 8u, 0u};
 +            load(rt, (old & masks[address & 3u]) | (memory << shifts[address & 3u]));
@@ -913,7 +915,7 @@ index 0000000..7d49f32
 +        {
 +            const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
 +            const uint32_t memory = m_memory.read32(address & ~3u);
-+            const uint32_t old = cpu.gpr[rt];
++            const uint32_t old = cpu.pendingLoad && cpu.pendingLoadReg == rt ? cpu.pendingLoadValue : cpu.gpr[rt]; // as LWL
 +            static constexpr uint32_t masks[4] = {0x00000000u, 0xFF000000u, 0xFFFF0000u, 0xFFFFFF00u};
 +            static constexpr uint32_t shifts[4] = {0u, 8u, 16u, 24u};
 +            load(rt, (old & masks[address & 3u]) | (memory >> shifts[address & 3u]));
@@ -4419,7 +4421,7 @@ index 944cee7..1752851 100644
                  return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
              case COP1_S_SUBA:
 diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
-index a2bcb77..55abb8d 100644
+index a2bcb77..cdc57b9 100644
 --- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
 +++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
 @@ -135,9 +135,9 @@ namespace ps2recomp
@@ -4452,6 +4454,31 @@ index a2bcb77..55abb8d 100644
 +        // Exchanges halfwords 0/2 and 4/6, preserving the other lanes.
 +        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEH(GPR_VEC(ctx, {})));",
                             inst.rd, inst.rt);
+     }
+ 
+@@ -471,15 +471,15 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
+     {
+-        // Parallel multiply halfword, results sum to HI/LO and rd
+-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
+-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
+-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
+-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
+-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
+-                           "   int64_t result = (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
+-                           "   ctx->lo = (uint32_t)result; ctx->hi = (uint32_t)(result >> 32); \n"
+-                           "   SET_GPR_U64(ctx, {}, result); }}",
++        // Parallel multiply halfword: eight signed 16x16 products p0..p7, kept separately (nothing is summed):
++        // LO = {p0, p1, p4, p5}, HI = {p2, p3, p6, p7}, rd = {p0, p2, p4, p6}.
++        return fmt::format("{{ __m128i a = GPR_VEC(ctx, {}), b = GPR_VEC(ctx, {}); \n"
++                           "   __m128i pl = _mm_mullo_epi16(a, b), ph = _mm_mulhi_epi16(a, b); \n"
++                           "   __m128i p03 = _mm_unpacklo_epi16(pl, ph), p47 = _mm_unpackhi_epi16(pl, ph); \n"
++                           "   __m128i lo = _mm_unpacklo_epi64(p03, p47), hi = _mm_unpackhi_epi64(p03, p47); \n"
++                           "   ctx->lo = (uint64_t)_mm_cvtsi128_si64(lo); ctx->lo1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(lo, lo)); \n"
++                           "   ctx->hi = (uint64_t)_mm_cvtsi128_si64(hi); ctx->hi1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(hi, hi)); \n"
++                           "   SET_GPR_VEC(ctx, {}, _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(p03), _mm_castsi128_ps(p47), _MM_SHUFFLE(2, 0, 2, 0)))); }}",
+                            inst.rs, inst.rt, inst.rd);
      }
  
 @@ -520,8 +520,8 @@ namespace ps2recomp
