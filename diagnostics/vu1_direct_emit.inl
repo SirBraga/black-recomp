@@ -637,13 +637,31 @@ namespace direct
             }
             case Upper::MaxMin:
             {
-                add("                    const V x = %s;\n", operand(u.fs, lanes, false).c_str());
-                add("                    const V y = %s;\n", rhsOperand(false).c_str());
-                add("                    const V u = vbslq_f32(%s(x, y), x, y);\n", u.isMax ? "vcgtq_f32" : "vcltq_f32");
+                // Raw register values compared as sign-magnitude numbers, one of them returned bit for bit (as
+                // vuMaxRaw/vuMiniRaw in the interpreter): no normalization of the operands.
+                std::string rhs;
+                switch (u.rhs)
+                {
+                case Upper::I: rhs = "vdupq_n_f32(vu.m_state.i)"; break;
+                case Upper::Bc:
+                    rhs = u.ft == 0u ? (u.bc == 3u ? "vdupq_n_f32(1.0f)" : "vdupq_n_f32(0.0f)")
+                                     : "vdupq_laneq_f32(" + vf(u.ft) + ", " + std::to_string(u.bc) + ")";
+                    break;
+                default: rhs = vf(u.ft); break;
+                }
+                add("                    const V x = %s;\n", vf(u.fs).c_str());
+                add("                    const V y = %s;\n", rhs.c_str());
+                add("                    const int32x4_t xi = vreinterpretq_s32_f32(x), yi = vreinterpretq_s32_f32(y);\n");
+                add("                    const int32x4_t xo = veorq_s32(xi, vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(vshrq_n_s32(xi, 31)), 1)));\n");
+                add("                    const int32x4_t yo = veorq_s32(yi, vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(vshrq_n_s32(yi, 31)), 1)));\n");
+                add("                    const V u = vbslq_f32(%s, x, y);\n", u.isMax ? "vcgtq_s32(xo, yo)" : "vcltq_s32(xo, yo)");
                 pending.write = true;
                 pending.reg = u.target;
                 pending.dest = u.dest;
-                pending.normalLanes = 0xFu;
+                // The result is one of the inputs: normal where both inputs are known normal.
+                const uint8_t rhsNormal = u.rhs == Upper::Bc ? (u.ft == 0u || (normal[u.ft] & (1u << u.bc)) ? 0xFu : 0u)
+                                         : u.rhs == Upper::I ? 0u : normal[u.ft];
+                pending.normalLanes = static_cast<uint8_t>((u.fs == 0u ? 0xFu : normal[u.fs]) & rhsNormal);
                 return pending;
             }
             case Upper::Itof:

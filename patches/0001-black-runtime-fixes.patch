@@ -18064,7 +18064,7 @@ index b02c7ca..c47bf4e 100644
 +    return pos;
  }
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..5640c82 100644
+index bd75bba..05e0b1d 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,23 +3,266 @@
@@ -20666,7 +20666,7 @@ index bd75bba..5640c82 100644
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
      m_state.haltAfterDelaySlot = false;
-@@ -1605,7 +3399,126 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1605,7 +3399,148 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
      m_state.vf[0][1] = 0.0f;
      m_state.vf[0][2] = 0.0f;
      m_state.vf[0][3] = 1.0f;
@@ -20702,6 +20702,28 @@ index bd75bba..5640c82 100644
 +    // The decoded cache must be the one of this code (ensureDecodedCodeCache()'s test), with its image found.
 +    const bool tracked = memory != nullptr && vuCode == (unit ? memory->getVU1Code() : memory->getVU0Code());
 +    const bool keyed = memory == nullptr && m_hasExternalCodeKey; // tests without a PS2Memory
++    // PS2X_VU_LEAN_STATS=1: why calls miss the lean path (counted per reason, printed now and then).
++    static const bool leanStats = std::getenv("PS2X_VU_LEAN_STATS") != nullptr;
++    if (leanStats)
++    {
++        static uint64_t n[12] = {}, calls = 0;
++        const bool cacheOk = m_decodedCodeCacheValid && m_cachedVuCode == vuCode && m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
++                             (keyed || !tracked || m_cachedCodeGeneration == (unit ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration()));
++        ++calls;
++        if (!configured) ++n[0];
++        else if (pipelinesPending()) ++n[1];
++        else if (!(tracked || keyed)) ++n[2];
++        else if (!cacheOk) ++n[3];
++        else if (m_analysis == nullptr || !m_analysis->resolved) ++n[4];
++        else if (m_analysis->image == nullptr) ++n[5];
++        else if (!m_analysis->statusUnobserved) ++n[6];
++        else if (maxCycles == 0u) ++n[7];
++        else ++n[8];
++        if ((calls & 0x3FFFFu) == 0u)
++            std::fprintf(stderr, "[vu-lean] unit%u calls=%llu lean=%llu | config=%llu pipelines=%llu untracked=%llu cache=%llu unresolved=%llu noimage=%llu status=%llu\n",
++                         unit, (unsigned long long)calls, (unsigned long long)n[8], (unsigned long long)n[0], (unsigned long long)n[1],
++                         (unsigned long long)n[2], (unsigned long long)n[3], (unsigned long long)n[4], (unsigned long long)n[5], (unsigned long long)n[6]);
++    }
 +    if (!configured || (m_engine != Engine::Default && m_engine != Engine::Recompiled) || pipelinesPending() || !(tracked || keyed) ||
 +        !m_decodedCodeCacheValid || m_cachedVuCode != vuCode || m_cachedMemory != memory || m_cachedCodeSize != codeSize ||
 +        m_cachedCodeGeneration != (keyed ? m_externalCodeKey : unit ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration()) ||
@@ -20794,7 +20816,7 @@ index bd75bba..5640c82 100644
  }
  
  void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
-@@ -1615,38 +3528,151 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+@@ -1615,38 +3550,151 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
  {
      m_state.top = top;
      m_state.itop = itop;
@@ -20955,7 +20977,7 @@ index bd75bba..5640c82 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1655,27 +3681,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1655,27 +3703,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                  break;
              }
              advanceTo(readyCycle);
@@ -20993,7 +21015,7 @@ index bd75bba..5640c82 100644
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
          float oldUpperVf[4]{};
          float newUpperVf[4]{};
-@@ -1687,9 +3709,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1687,9 +3731,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
              std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
@@ -21016,7 +21038,7 @@ index bd75bba..5640c82 100644
          if (decoded.iBit)
          {
              execUpper(decoded.upper);
-@@ -1719,11 +3753,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1719,11 +3775,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          else
          {
              execUpper(decoded.upper);
@@ -21051,7 +21073,7 @@ index bd75bba..5640c82 100644
          if (hasUpperWrite)
          {
              std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
-@@ -1743,7 +3800,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1743,7 +3822,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                           : decoded.lowerUsage.latency;
              queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
          }
@@ -21060,7 +21082,7 @@ index bd75bba..5640c82 100644
          {
              std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
              std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
-@@ -1752,7 +3809,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1752,7 +3831,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              queueAccWrite(decoded.upperUsage.accWrite, newAcc,
                            kAccForwardLatency);
          }
@@ -21069,7 +21091,7 @@ index bd75bba..5640c82 100644
          {
              const int32_t newVi = m_state.vi[writtenVi];
              m_state.vi[writtenVi] = oldVi;
-@@ -1819,11 +3876,44 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1819,11 +3898,44 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              m_pendingHaltT = tHalt;
          }
  
@@ -23308,10 +23330,10 @@ index 6974254..e35a082 100644
  }
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.inl
 new file mode 100644
-index 0000000..fded103
+index 0000000..ca8219d
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.inl
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,837 @@
 +// Upper-instruction bodies, shared by the interpreter and the recompiled blocks.
 +#pragma once
 +#include "runtime/ps2_vu1.h"
@@ -23326,6 +23348,39 @@ index 0000000..fded103
 +
 +namespace
 +{
++    // MAX/MINI compare the raw register values as sign-magnitude numbers and return one of them bit for bit: an
++    // exponent-255 pattern is just the largest magnitude, -0 is below +0 (IEEE comparisons on normalized operands
++    // got both wrong).
++    inline int32_t vuOrderedBits(float value)
++    {
++        int32_t bits;
++        std::memcpy(&bits, &value, sizeof(bits));
++        return bits < 0 ? (bits ^ 0x7FFFFFFF) : bits;
++    }
++    inline void vuMaxMinProbe(float a, float b, float now, bool isMax)
++    {
++        static const bool probe = std::getenv("PS2X_VU_MAXMIN_PROBE") != nullptr;
++        if (!probe)
++            return;
++        auto norm = [](float v) {
++            uint32_t u; std::memcpy(&u, &v, 4);
++            const uint32_t e = (u >> 23) & 0xFFu;
++            if (e == 0u) u &= 0x80000000u; else if (e == 0xFFu) u = (u & 0x80000000u) | 0x7F7FFFFFu;
++            float r; std::memcpy(&r, &u, 4); return r; };
++        const float na = norm(a), nb = norm(b);
++        const float old = isMax ? (na > nb ? na : nb) : (na < nb ? na : nb);
++        uint32_t o, n, ua, ub;
++        std::memcpy(&o, &old, 4); std::memcpy(&n, &now, 4); std::memcpy(&ua, &a, 4); std::memcpy(&ub, &b, 4);
++        static unsigned printed = 0;
++        if (o != n && printed < 30)
++        {
++            ++printed;
++            std::fprintf(stderr, "[maxmin] %s a=%08x b=%08x old=%08x new=%08x\n", isMax ? "MAX" : "MINI", ua, ub, o, n);
++        }
++    }
++    inline float vuMaxRaw(float a, float b) { const float r = vuOrderedBits(a) > vuOrderedBits(b) ? a : b; vuMaxMinProbe(a, b, r, true); return r; }
++    inline float vuMiniRaw(float a, float b) { const float r = vuOrderedBits(a) < vuOrderedBits(b) ? a : b; vuMaxMinProbe(a, b, r, false); return r; }
++
 +#if defined(__aarch64__) || defined(_M_ARM64)
 +    inline void normalizeVuVector(float output[4], const float input[4])
 +    {
@@ -23605,9 +23660,8 @@ index 0000000..fded103
 +    case 0x12:
 +    case 0x13: // MAXbc
 +    {
-+        float bc = broadcast(op & 3);
 +        for (int c = 0; c < 4; c++)
-+            result[c] = (vs[c] > bc) ? vs[c] : bc;
++            result[c] = vuMaxRaw(m_state.vf[fs][c], m_state.vf[ft][op & 3]);
 +        vuApplyDest(vd, result, dest);
 +        return;
 +    }
@@ -23616,9 +23670,8 @@ index 0000000..fded103
 +    case 0x16:
 +    case 0x17: // MINIbc
 +    {
-+        float bc = broadcast(op & 3);
 +        for (int c = 0; c < 4; c++)
-+            result[c] = (vs[c] < bc) ? vs[c] : bc;
++            result[c] = vuMiniRaw(m_state.vf[fs][c], m_state.vf[ft][op & 3]);
 +        vuApplyDest(vd, result, dest);
 +        return;
 +    }
@@ -23646,7 +23699,7 @@ index 0000000..fded103
 +        return;
 +    case 0x1D: // MAXi
 +        for (int c = 0; c < 4; c++)
-+            result[c] = (vs[c] > i) ? vs[c] : i;
++            result[c] = vuMaxRaw(m_state.vf[fs][c], m_state.i);
 +        vuApplyDest(vd, result, dest);
 +        return;
 +    case 0x1E: // MULi
@@ -23659,7 +23712,7 @@ index 0000000..fded103
 +        return;
 +    case 0x1F: // MINIi
 +        for (int c = 0; c < 4; c++)
-+            result[c] = (vs[c] < i) ? vs[c] : i;
++            result[c] = vuMiniRaw(m_state.vf[fs][c], m_state.i);
 +        vuApplyDest(vd, result, dest);
 +        return;
 +    case 0x20: // ADDq
@@ -23752,7 +23805,7 @@ index 0000000..fded103
 +        return;
 +    case 0x2B: // MAX
 +        for (int c = 0; c < 4; c++)
-+            result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c];
++            result[c] = vuMaxRaw(m_state.vf[fs][c], m_state.vf[ft][c]);
 +        vuApplyDest(vd, result, dest);
 +        return;
 +    case 0x2C: // SUB
@@ -23780,7 +23833,7 @@ index 0000000..fded103
 +        return;
 +    case 0x2F: // MINI
 +        for (int c = 0; c < 4; c++)
-+            result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c];
++            result[c] = vuMiniRaw(m_state.vf[fs][c], m_state.vf[ft][c]);
 +        vuApplyDest(vd, result, dest);
 +        return;
 +
