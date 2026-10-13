@@ -16,16 +16,16 @@ Só funciona no macOS com Apple Silicon (testei num M1 Pro).
 
 ## Quanto falta pra ser um recomp bom de jogar
 
-**Leitura de hoje (2026-10-13): uns 58%.** A meta é jogar o Black no PC com gráfico bom e 60 fps de verdade (o jogo gerando 60 quadros, não acelerado). É um chute, mas é assim que eu chego nele:
+**Leitura de hoje (2026-10-13): uns 60%.** A meta é jogar o Black no PC com gráfico bom e 60 fps de verdade (o jogo gerando 60 quadros, não acelerado). É um chute, mas é assim que eu chego nele:
 
 | pedaço da meta | peso | onde tá | por quê |
 |---|---|---|---|
 | Rodar sem travar nem corromper | 25% | ~80% | O congelamento aleatório foi achado e corrigido (era um desvio de 64 bits traduzido errado). Ainda tem a abertura de arquivo que falha às vezes e só o começo do jogo foi testado. |
 | Gráfico bom | 25% | ~75% | O renderizador Metal é o padrão, bate com a referência (0,01–0,22% de pixels diferentes) e roda em 3× com 16:9. Fumaça, fogo e brilho foram corrigidos. Falta o reflexo das armas, que aparece com triângulos brancos (bug em aberto, antes do GS). |
-| 60 fps de verdade | 25% | ~70% | Na rua do Level_00 (posição de um savestate do PCSX2), em 2× e sem perfilador: 59,9 de média. Sobram engasgos de um quadro (~31–34 ms, uns 10 a cada 50 s parado), com nenhuma thread no limite; a causa ainda não foi achada. A 60 a pistola atira mais rápido que a animação dela. Falta medir em combate e nas outras fases. |
+| 60 fps de verdade | 25% | ~85% | 60 ticks é o padrão (o jogo gera 60 quadros, não acelera). Os quadros são apresentados no flip do próprio jogo e o vblank do jogo segue a tela (CVDisplayLink, 120 Hz → um vblank a cada 2 atualizações da tela): nas medições de jogo, 0 quadros atrasados na tela. A GPU leva ~8 ms por quadro em 3× no ponto pesado (0 de 120 acima de 16 ms). Falta revisar as poucas constantes do jogo que assumem 30 Hz e medir nas outras fases. |
 | Jogo inteiro, som, save | 25% | ~25% | Som funcionando (SPU2 sintetizado, com reverb), mouse e teclado como num FPS de PC. Só o Level_00 foi testado; memory card ainda não. |
 
-Somando com os pesos dá ~62%; eu puxo pra ~58% porque a última linha é a mais incerta (ninguém jogou depois da primeira fase) e porque só roda em Mac com Apple Silicon. O que mais mexe nesse número é jogar as outras fases.
+Somando com os pesos dá ~66%; eu puxo pra ~60% porque a última linha é a mais incerta (ninguém jogou depois da primeira fase) e porque só roda em Mac com Apple Silicon. O que mais mexe nesse número é jogar as outras fases.
 
 ## Progresso por parte
 
@@ -44,7 +44,7 @@ Chute meu, com base no que já foi testado. Não é uma métrica oficial.
 | Disco/arquivos | ~75% | Carrega tudo do disco, mas às vezes uma abertura de arquivo falha. |
 | Áudio | ~70% | O SPU2 agora sintetiza o som de verdade: ADPCM, interpolação gaussiana do hardware, envelopes, volumes, reverb, a entrada de PCM que o driver do jogo mistura no IOP e a saída de cada núcleo na RAM de som. Vozes, rádio e recargas ok; os tiros ainda saem um pouco abafados comparando com o PCSX2. |
 | Memory card/save | ? | Passa pelo aviso do memory card, salvar ainda não foi testado. |
-| 60 fps | ~75% | 56–60 na maior parte do Level_00. Ainda tem quedas no ponto pesado, e falta revisar o que no jogo assume 30 Hz. |
+| 60 fps | ~85% | 60 constante no Level_00, inclusive no ponto pesado e nas explosões (as quedas vinham de cópias de alvo na GPU e da apresentação fora do flip, ambas corrigidas). Thread do jogo em ~22% no ponto pesado. Falta revisar o que no jogo assume 30 Hz e testar as outras fases. |
 | Tradução pt-BR | em andamento | Os textos do jogo (`MAINUS.BIN`, 1.716 entradas) têm uma versão em português, sem acentos por enquanto (a fonte do jogo só tem ASCII). O launcher abre em português por padrão. Revisão do texto ainda em curso; só foi testada no começo do jogo. |
 | Jogo inteiro | ~5% | Só testei o começo (Level_00 / Veblensk). |
 
@@ -57,16 +57,16 @@ Chute meu, com base no que já foi testado. Não é uma métrica oficial.
 - **A VU1 já é mais rápida que a do PS2.** Os microprogramas viram blocos NEON nativos (99,9% dos pares de instrução rodam assim). No replay de traces gravados do jogo dá ~1,6–1,7 ns por par, contra ~3,4 ns no chip de verdade, ou seja, ~2× mais rápida que o console, com 0 divergências contra a referência.
 - A VU0 usa o mesmo gerador e agora também passa o console: ~2,0 ns por par em jogo (uma chamada de microprograma leva ~100 ns). A thread do jogo roda no mesmo modo de ponto flutuante da VU (arredonda para zero, sem denormais, como o EE de verdade), então a chamada não troca de modo.
 - O microcódigo da VU sai direto do seu ELF na hora do build. Nada disso vem no repo.
-- **60 fps tá perto.** Com `BLACK_TICK_RATE=60` (experimental, desligado por padrão) o jogo roda a 60 atualizações por segundo. No percurso do Level_00 fica em 56–60 a maior parte do tempo. A 30 fica cravado em 30.
+- **60 fps de verdade, por padrão.** `BLACK_TICK_RATE=60` é o padrão do launcher: o jogo roda a lógica a 60 atualizações por segundo e gera 60 quadros (`BLACK_TICK_RATE=30` volta ao ritmo original). Os timers do jogo contam ticks, então quando uma atualização pega mais de um vblank os ticks extras são somados ao contador, e o vídeo do menu avança pelo tempo real.
 - O que ajudou a chegar aí: espera do vblank sem gastar CPU, UNPACK do VIF1 mais rápido, 8 contextos de quadro no Granite (paraLLEl-GS) e as otimizações da VU.
 - **Num ponto bem pesado** (olhando pela janela, ~117 mil primitivos por quadro) o paraLLEl-GS segura em ~36 a 60 ticks.
-- **Renderizador nativo em Metal** (`gpu/native/`, padrão do launcher; `BLACK_GS=parallel` volta ao paraLLEl-GS). No mesmo ponto pesado chega a ~60. Num replay do mesmo trecho leva ~7 ms por quadro contra ~28 ms do paraLLEl-GS. Desenha direto na janela e aceita resolução interna maior (`BLACK_GS_SCALE=2`, `3`, `4`...): em 2× (1280×896) e em 4× segura 60 no ponto pesado. Só a cena é ampliada; os buffers de efeito do jogo (luz, brilho, fumaça) ficam na resolução original pra manter o borrão. Detalhes em [GS_NATIVE_RENDERER_PLAN.md](GS_NATIVE_RENDERER_PLAN.md).
+- **Renderizador nativo em Metal** (`gpu/native/`, padrão do launcher; `BLACK_GS=parallel` volta ao paraLLEl-GS). Desenha direto na janela, apresenta no flip do jogo e aceita resolução interna maior (`BLACK_GS_SCALE`, padrão 3). Todos os alvos são ampliados (os buffers de efeito usam um filtro de caixa pra manter o borrão sem virar escada). Com os shaders especializados por estado (Metal function constants, compilados em segundo plano), o quadro pesado em 16:9 caiu de 7,5 pra 4,4 ms em 3× no replay. Detalhes em [GS_NATIVE_RENDERER_PLAN.md](GS_NATIVE_RENDERER_PLAN.md).
 - **O céu aparece no renderizador Metal.** O jogo desenha as nuvens uma vez no carregamento e desenha as próprias paletas com triângulos; o renderizador agora acompanha isso sem passar pela CPU.
 - **Colisões: corrigi a latência da divisão da VU0.** Em dois lugares o jogo lê o resultado da divisão anterior logo depois de começar uma nova; o código recompilado entregava o resultado novo. É o mesmo problema que o PCSX2 corrige com um patch ("fixes broken collisions"). Achei comparando o código na RAM de um savestate do PCSX2 com a nossa.
 - **Tradução pra português do Brasil (em andamento).** O arquivo de textos do jogo ganhou uma versão pt-BR, montada por `tools/loc/install.sh` (fica na raiz do projeto, fora deste repo) a partir do arquivo do seu disco; `tools/loc/install.sh --restore` volta o inglês. O jogo só lê esse arquivo quando roda dos arquivos soltos de `recomp/disc`, então o launcher passou a abrir assim por padrão (`BLACK_LANG=en` usa a imagem do disco, em inglês). Sem acentos ainda.
-- **IOP em thread própria** (`BLACK_IOP_THREAD=1`, experimental). Tira o IOP da thread do jogo (de ~12% pra ~1,5% dela). Num teste de 90 s no ponto pesado os intervalos acima de 20 ms caíram de 220 pra 1. Problema conhecido: sem som nesse modo.
+- **IOP em thread própria, por padrão** (`BLACK_IOP_THREAD=0` volta à thread do jogo). Tira o IOP da thread do jogo (de ~12% pra ~1,5% dela) e, desde que o SPU2 passou a sintetizar o som, funciona com áudio.
 - **O jogo não dispara mais acima de 60 depois de um trecho lento.** O relógio de vblank "devia" o tempo perdido e os vblanks seguintes chegavam colados; agora o atraso é descartado.
-- **Registro de engasgos sem perfilador.** O launcher grava em `recomp/diagnostics/hitches.log` as janelas de 2 s que tiveram atualização lenta, com a ocupação de cada thread e as esperas entre elas. (O perfilador `sample` do macOS derruba o jogo pra 30–45 enquanto roda; as "quedas" que eu anotava antes vinham em boa parte dele.)
+- **Registro de engasgos sem perfilador.** O launcher grava em `recomp/diagnostics/hitches.log` as janelas de 2 s com atualização lenta e, do lado da GPU, quantos quadros chegaram atrasados à tela (medido pelo `presentedTime` do Metal, que é o que a gente vê). (O perfilador `sample` do macOS derruba o jogo pra 30–45 enquanto roda.)
 - **Thread da VU1 mais leve.** Saíram cópias e uma varredura de pacotes que eram ~18% dela; hoje ~71% do tempo dela é o código dos microprogramas.
 - **O travamento aleatório foi resolvido.** Era um erro do tradutor da EE: `bltz/bgez/blez/bgtz` testavam só 32 bits e o PS2 testa 64. Uma travessia de grafo do jogo nunca terminava, estourava a pilha dela e sobrescrevia a fila de desenho. Achei com um ponto de vigia no depurador (`BLACK_WATCH=1`). Depois da correção o tutorial do começo da fase ("PRESS R1 TO FIRE WEAPON") passou a aparecer, o que não acontecia antes.
 - **Som (2026-10-12).** O SPU2 do IOP só simulava o tempo das vozes; agora mixa de verdade, seguindo o roteamento do hardware (o Black lê de volta a saída de um núcleo, processa no IOP e devolve como PCM). Sai num stream de 48 kHz com reamostragem cúbica que acompanha a diferença de 0,4% entre o relógio do jogo e o do Mac.
@@ -79,23 +79,20 @@ Chute meu, com base no que já foi testado. Não é uma métrica oficial.
 
 Ainda não dá pra jogar de verdade.
 
-- Engasgos de um quadro (~31–34 ms) mesmo a ~60 de média e com as threads longe do limite. Já descartei: espera entre as threads, atraso do vblank e o IOP. Ainda não sei a causa.
-- A 60 ticks a pistola atira mais rápido que a animação (algo na arma conta em quadros). O patch de 60 fps que existe pro PCSX2 não serve de comparação: ele dobra a velocidade do jogo.
 - Reflexo das armas com triângulos brancos (a passada de reflexo recebe coordenadas fora de [0,1] da VU1; o PCSX2 recebe dentro). Investigação em [PS2_PROJECT_STATE.md](PS2_PROJECT_STATE.md).
 - Tiros um pouco abafados em relação ao PCSX2.
 - Tradução: sem acentos, revisão em curso, e só o começo do jogo foi visto em português.
 - As correções dos desvios de 64 bits e da divisão da VU0 mexem na lógica do jogo inteiro: falta rever jogando os sintomas antigos de comportamento (chão perto da porta, objetos que faltavam).
 - Chão liso ou com buracos perto da porta da sala inicial. Ainda investigando.
 - Às vezes uma abertura de arquivo falha sem motivo (parece corrida entre threads).
-- Alta resolução: quebrada no paraLLEl-GS. No Metal funciona; em 4× fica em ~38 e aparecem riscos finos nos feixes de luz.
+- Alta resolução no paraLLEl-GS continua quebrada (no Metal, que é o padrão, funciona).
 - Só testei o começo do jogo (Level_00 / Veblensk).
 
 ## Próximos passos
 
-- Terminar o renderizador Metal e deixar ele como padrão.
-- VU de "alto nível" de verdade: resolver o timing na hora de gerar o código, uma função por microprograma e cobrir o resto dos pares. Isso inclui melhorar a VU0.
+- VU de "alto nível" de verdade: a VU1 ainda está em ~1,6 ns por par (meta: 1,5); na VU0 o que pesa é o custo fixo de cada chamada (programas de ~49 pares).
 - Fechar o bug do reflexo das armas; levar o max/min exato também pro modo micro da VU (interpretador + gerador); baixar o custo fixo de cada chamada da VU0.
-- Pra mirar 120: dividir a VU1 entre núcleos (precisa de execução especulativa: a saída de um lote quase nunca depende do vizinho, mas quase todo lote deixa o estado diferente) e chamadas diretas no EE.
+- Pra mirar 120 quadros reais: dividir a VU1 entre núcleos (precisa de execução especulativa) e baixar o tempo do EE (as chamadas diretas já ficaram inline; falta um benchmark determinístico do EE pra medir ganhos de 1–5%).
 - Testar o jogo inteiro.
 - Um `setup.sh` pra montar tudo de uma vez.
 
