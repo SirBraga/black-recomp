@@ -107,7 +107,36 @@ int main(int argc, char **argv)
 
     // (lower, upper, bits, writtenVi, shadowReg, mayEnd) -> pair function id
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint64_t, uint32_t>, uint32_t> pairIds;
-    std::string pairFunctions, imageFunctions, table[2], programTable;
+    // PS2X_VU_RECOMPILE_PROFILE=<file>[:<file>...]: execution counts of the pairs of recorded traces
+    // (ps2x_vu1_trace_replay with PS2X_VU_PC_HISTOGRAM; lines "unit hash pc count cycles lower upper bits"). A pair
+    // is hot when it accounts for at least 1/2000 of its unit's executed pairs.
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> profile;
+    uint64_t hotCountOf[2] = {~0ull, ~0ull};
+    if (const char *paths = std::getenv("PS2X_VU_RECOMPILE_PROFILE"))
+    {
+        uint64_t total[2] = {};
+        std::string list = paths;
+        for (size_t at = 0; at <= list.size();)
+        {
+            const size_t end = std::min(list.find(':', at), list.size());
+            if (std::FILE *file = std::fopen(list.substr(at, end - at).c_str(), "r"))
+            {
+                unsigned unitOf, pc, lower, upper, bits;
+                unsigned long long hash, count, cycles;
+                while (std::fscanf(file, "%u %llx %x %llu %llu %x %x %x", &unitOf, &hash, &pc, &count, &cycles, &lower, &upper, &bits) == 8)
+                {
+                    profile[std::make_tuple(unitOf & 1u, pc, lower, upper)] += count;
+                    total[unitOf & 1u] += count;
+                }
+                std::fclose(file);
+            }
+            at = end + 1u;
+        }
+        for (uint32_t which = 0; which < 2u; ++which)
+            hotCountOf[which] = std::max<uint64_t>(total[which] / 2000u, 1u);
+    }
+    std::string pairFunctions, declarations, table[2], programTable;
+    std::vector<std::pair<uint32_t, std::string>> functions; // pairs, text of one image/program function
     size_t programCount = 0;
     std::set<std::pair<uint32_t, uint64_t>> emittedImages;
     size_t totalPairs = 0, flagWriters = 0, liveWriters = 0, directBlocks = 0, directPairs = 0;
@@ -216,7 +245,7 @@ int main(int argc, char **argv)
         // Direct blocks (vu1_direct_emit.inl): blockLength[p] != 0 at the first pair of a block, inBlock[p]
         // for the pairs it covers. PS2X_VU_RECOMPILE_NO_DIRECT=1 keeps every pair on stepPair().
         std::vector<uint32_t> blockLength(kPairs, 0u);
-        std::vector<bool> inBlock(kPairs, false), blockBranches(kPairs, false);
+        std::vector<bool> inBlock(kPairs, false), blockBranches(kPairs, false), blockEnds(kPairs, false);
         if (!std::getenv("PS2X_VU_RECOMPILE_NO_DIRECT"))
         {
             std::vector<bool> target(kPairs, false), afterCall(kPairs, false);
@@ -247,27 +276,71 @@ int main(int argc, char **argv)
             {
                 return p < kPairs && included[p] && direct::pairIsDirect(facts[p], endsProgram(p));
             };
+            const uint32_t minBlock = std::getenv("PS2X_VU_RECOMPILE_MIN_BLOCK") ? uint32_t(std::atoi(std::getenv("PS2X_VU_RECOMPILE_MIN_BLOCK"))) : 1u;
             uint32_t start = kPairs, length = 0u;
-            const auto close = [&](bool branches)
+            const auto close = [&](bool branches, bool ends = false)
             {
-                if (start < kPairs && length >= 3u)
+                if (start < kPairs && length >= minBlock)
                 {
                     blockLength[start] = length;
                     blockBranches[start] = branches;
+                    blockEnds[start] = ends;
                     for (uint32_t q = start; q < start + length; ++q)
                         inBlock[q] = true;
                 }
                 start = kPairs;
                 length = 0u;
             };
-            for (uint32_t p = 0; p < kPairs; ++p)
+            // Superblocks (PS2X_VU_RECOMPILE_SUPERBLOCKS=0 for the old layout): a block no longer stops where some
+            // branch lands. It runs on (up to 128 pairs) and the landing pair starts a block of its own as well, so
+            // the code after it exists twice; in exchange a loop whose body has such landing pairs is one block from
+            // its head to its closing branch, and its registers stay in machine registers from one turn to the next.
+            const bool superblocks = !(std::getenv("PS2X_VU_RECOMPILE_SUPERBLOCKS") && std::getenv("PS2X_VU_RECOMPILE_SUPERBLOCKS")[0] == '0') && !profile.empty();
+            // Doing it everywhere makes the generated code five times larger: only landing pairs that the recorded
+            // traces show to be hot (PS2X_VU_RECOMPILE_PROFILE, see below) are run through.
+            const uint64_t hotCount = hotCountOf[unit & 1u];
+            const auto hot = [&](uint32_t p)
             {
-                if (target[p])
-                    close(false);
-                const bool branch = plain(p) && direct::pairIsBranch(facts[p]);
-                if (!plain(p) || afterBranch(p) || (branch && (length == 0u || !plain(p + 1u) || direct::pairIsBranch(facts[p + 1u]) || target[p + 1u])))
+                const auto found = profile.find(std::make_tuple(unit, p * 8u, facts[p].lower, facts[p].upper));
+                return found != profile.end() && found->second >= hotCount;
+            };
+            // single: only the block that starts at `begin` (a landing pair inside an existing block).
+            const auto scan = [&](uint32_t begin, bool single)
+            {
+            bool done = false;
+            for (uint32_t p = begin; p < kPairs && !done; ++p)
+            {
+                if ((target[p] && !(superblocks && hot(p))) || (superblocks && length >= 128u))
                 {
                     close(false);
+                    done = single;
+                    if (done)
+                        break;
+                }
+                // The E-bit pair and the pair after it, when both are otherwise ordinary, close the block they are
+                // in: it returns Ended. (Every microprogram call ends this way; left to stepPair() these two pairs
+                // cost as much as a few dozen direct ones.)
+                if (p + 1u < kPairs && included[p] && included[p + 1u] && (facts[p].bits & VU1Interpreter::PairEBit) != 0u &&
+                    direct::pairIsOrdinary(facts[p]) && !direct::pairIsBranch(facts[p]) && !(afterBranch(p) && length == 0u) &&
+                    (facts[p + 1u].bits & VU1Interpreter::PairEndBits) == 0u && direct::pairIsOrdinary(facts[p + 1u]) &&
+                    !direct::pairIsBranch(facts[p + 1u]) && !std::getenv("PS2X_VU_RECOMPILE_NO_END_BLOCKS"))
+                {
+                    if (length == 0u)
+                        start = p;
+                    length += 2u;
+                    close(false, true);
+                    done = single;
+                    ++p;
+                    continue;
+                }
+                const bool branch = plain(p) && direct::pairIsBranch(facts[p]);
+                // A block may start at a branch (the value it tests comes from the hidden-register state when the pair
+                // before it wrote the register), and a run of one or two pairs is still a block: both used to be left to
+                // stepPair(), about ten times slower per pair.
+                if (!plain(p) || (afterBranch(p) && length == 0u) || (branch && (!plain(p + 1u) || direct::pairIsBranch(facts[p + 1u]) || target[p + 1u])))
+                {
+                    close(false);
+                    done = single;
                     continue;
                 }
                 if (length == 0u)
@@ -280,16 +353,54 @@ int main(int argc, char **argv)
                     // The block goes on after a conditional branch (it leaves through a side exit when taken)
                     // unless the next pair must start a block of its own.
                     const uint32_t op = (facts[p - 1u].lower >> 25) & 0x7Fu;
-                    if (op == 0x20u || !plain(p + 1u) || target[p + 1u] || length >= 96u)
+                    if (op == 0x20u || direct::pairIsIndirect(facts[p - 1u]) || !plain(p + 1u) || (target[p + 1u] && !(superblocks && hot(p + 1u))) || length >= 96u)
+                    {
                         close(true);
+                        done = single;
+                    }
                 }
             }
             close(false);
+            };
+            scan(0u, false);
+            if (superblocks)
+                for (uint32_t q = 0; q < kPairs; ++q)
+                    if (target[q] && included[q] && blockLength[q] == 0u)
+                        scan(q, true);
+            // PS2X_VU_RECOMPILE_NONDIRECT=<file>: the pairs left to stepPair() and why (appended, one line per pair:
+            // pc, lower, upper, bits, reason), to be joined with a PS2X_VU_PC_HISTOGRAM of a trace.
+            if (const char *path = std::getenv("PS2X_VU_RECOMPILE_NONDIRECT"))
+                if (std::FILE *file = std::fopen(path, "a"))
+                {
+                    for (uint32_t p = 0; p < kPairs; ++p)
+                    {
+                        if (!included[p] || inBlock[p])
+                            continue;
+                        const Facts &f = facts[p];
+                        const char *reason = "short-run";
+                        if (!direct::pairIsDirect(f, endsProgram(p)))
+                        {
+                            const bool iBit = (f.bits & VU1Interpreter::PairIBit) != 0u;
+                            reason = endsProgram(p) ? "program-end" : (f.bits & VU1Interpreter::PairEfu) ? "efu" : (f.bits & VU1Interpreter::PairIndirect) ? "indirect-jump"
+                                   : (f.bits & (VU1Interpreter::PairReserved | VU1Interpreter::PairDBit | VU1Interpreter::PairTBit)) ? "reserved/d/t"
+                                   : direct::decodeUpper(f.upper).kind == direct::Upper::None ? "upper-op" : direct::decodeLower(f.lower, iBit).kind == direct::Lower::None ? "lower-op" : "other";
+                        }
+                        else if (afterBranch(p))
+                            reason = "after-branch";
+                        else if (direct::pairIsBranch(f))
+                            reason = "branch";
+                        std::fprintf(file, "%04x %08x %08x %05x %s\n", p * 8u, f.lower, f.upper, unsigned(f.bits), reason);
+                    }
+                    std::fclose(file);
+                }
         }
 
         char text[1024];
         std::string body;
         uint32_t count = 0;
+        // PS2X_VU_RECOMPILE_SHARED=0: every block loads and stores its own registers, as before.
+        const bool sharedRegisters = !(std::getenv("PS2X_VU_RECOMPILE_SHARED") && std::getenv("PS2X_VU_RECOMPILE_SHARED")[0] == '0');
+        direct::SharedRegisters shared;
         for (uint32_t p = 0; p < kPairs; ++p)
         {
             if (!included[p])
@@ -299,23 +410,40 @@ int main(int argc, char **argv)
             {
                 ++directBlocks;
                 directPairs += blockLength[p];
-                std::snprintf(text, sizeof(text), "            case 0x%04xu:\n#if defined(__aarch64__)\n            B%04x:\n                if (direct && vu.directBlockAllowed(0x%04xu))\n                {\n",
-                              p * 8u, p * 8u, p * 8u);
+                // PS2X_VU_RECOMPILE_BLOCKS=<file>: every block (pc, lower and upper word of its first pair, length).
+                if (const char *path = std::getenv("PS2X_VU_RECOMPILE_BLOCKS"))
+                    if (std::FILE *file = std::fopen(path, "a"))
+                    {
+                        std::fprintf(file, "%04x %08x %08x %u\n", p * 8u, facts[p].lower, facts[p].upper, blockLength[p]);
+                        std::fclose(file);
+                    }
+                if (sharedRegisters)
+                    std::snprintf(text, sizeof(text), "            case 0x%04xu:\n#if defined(__aarch64__)\n                if (direct && vu.directBlockAllowed(0x%04xu))\n                {\n"
+                                                      "                    VU_LOAD\n                    goto B%04x;\n                }\n#endif\n                return R::NotHandled;\n"
+                                                      "#if defined(__aarch64__)\n            B%04x:\n                {\n",
+                                  p * 8u, p * 8u, p * 8u, p * 8u);
+                else
+                    std::snprintf(text, sizeof(text), "            case 0x%04xu:\n#if defined(__aarch64__)\n            B%04x:\n                if (direct && vu.directBlockAllowed(0x%04xu))\n                {\n",
+                                  p * 8u, p * 8u, p * 8u);
                 body += text;
                 // Continuing at another block of this function skips the dispatch switch; the loop's own
                 // entry conditions that a block can change (the cycle budget) are tested here instead.
                 const auto chain = [&](uint32_t pc) -> std::string
                 {
+                    const char *leave = sharedRegisters ? "VU_STORE continue;" : "continue;";
                     if (pc / 8u >= kPairs || blockLength[pc / 8u] == 0u)
-                        return "continue;";
-                    char jump[160];
-                    std::snprintf(jump, sizeof(jump), "if (vu.m_cycle + %uu <= budgetEnd && !vu.m_stopRequested) goto B%04x; continue;", maxRun, pc);
+                        return leave;
+                    char jump[240];
+                    if (sharedRegisters)
+                        std::snprintf(jump, sizeof(jump), "if (vu.m_cycle + %uu <= budgetEnd && !vu.m_stopRequested && vu.directBlockAllowed(0x%04xu)) goto B%04x; %s", maxRun, pc, pc, leave);
+                    else
+                        std::snprintf(jump, sizeof(jump), "if (vu.m_cycle + %uu <= budgetEnd && !vu.m_stopRequested) goto B%04x; %s", maxRun, pc, leave);
                     return jump;
                 };
                 char again[200];
                 std::snprintf(again, sizeof(again), "c + %uu <= budgetEnd && !vu.m_stopRequested && vu.directBlockAllowed(0x%04xu)", maxRun + blockLength[p], p * 8u);
-                body += direct::emitBlock(facts, p, blockLength[p], codeSize - 1u, chain, again);
-                body += "                }\n#endif\n                return R::NotHandled;\n";
+                body += direct::emitBlock(facts, p, blockLength[p], codeSize - 1u, chain, again, nullptr, blockEnds[p], sharedRegisters ? &shared : nullptr);
+                body += sharedRegisters ? "                }\n#endif\n" : "                }\n#endif\n                return R::NotHandled;\n";
             }
             if (inBlock[p])
                 continue;
@@ -339,7 +467,7 @@ int main(int argc, char **argv)
                 found = pairIds.emplace(key, static_cast<uint32_t>(pairIds.size())).first;
                 std::snprintf(text, sizeof(text),
                               "    static inline __attribute__((always_inline)) R P%u(VU1Interpreter &vu, uint32_t pc, VU_BLOCK_PARAMS)\n"
-                              "    { return vu.stepPair(pc, 0x%08xu, 0x%08xu, 0x%05xu, %uu, %uu, 0x%llxull, 0x%xu, %s, 0x%xu, vuData, dataSize, gs, memory, budgetEnd); }\n",
+                              "    { return vu.stepPairCall(pc, 0x%08xu, 0x%08xu, 0x%05xu, %uu, %uu, 0x%llxull, 0x%xu, %s, 0x%xu, vuData, dataSize, gs, memory, budgetEnd); }\n",
                               found->second, f.lower, f.upper, bits, unsigned(f.writtenVi), unsigned(f.shadowReg),
                               static_cast<unsigned long long>(f.hazardReads), unsigned(f.hazardWrites),
                               mayEnd ? "true" : "false", codeSize);
@@ -380,10 +508,11 @@ int main(int argc, char **argv)
         totalPairs += count;
         std::snprintf(text, sizeof(text),
                       "    // %s: %u pairs\n"
-                      "    static R %s%u_%016llx(VU1Interpreter &vu, uint32_t codeSize, VU_BLOCK_PARAMS)\n"
+                      "    VuRecompiled::R VuRecompiled::%s%u_%016llx(VU1Interpreter &vu, uint32_t codeSize, VU_BLOCK_PARAMS)\n"
                       "    {\n"
                       "        if (codeSize != 0x%xu) return R::NotHandled;\n"
                       "        const bool direct = vu.directBlocksUsable(vuData, dataSize); (void)direct;\n"
+                      "        VU_REGS\n"
                       "        for (;;)\n"
                       "        {\n"
                       "            if (vu.m_cycle + %uu > budgetEnd || vu.m_stopRequested || vu.m_state.branchPending ||\n"
@@ -393,9 +522,53 @@ int main(int argc, char **argv)
                       "            {\n",
                       base.c_str(), count, isProgram ? "prog" : "image", unit,
                       static_cast<unsigned long long>(hash), codeSize, maxRun);
-        imageFunctions += text;
-        imageFunctions += body;
-        imageFunctions += "            default:\n                return R::NotHandled;\n            }\n        }\n    }\n\n";
+        std::string function;
+        {
+            // The registers of the function's direct blocks (see direct::SharedRegisters): declared once, loaded
+            // when a block is entered from code that works on the VU state, stored when such code comes next.
+            std::string regs, load, store;
+            char one[96];
+            for (uint32_t reg = 1; reg <= 32u; ++reg)
+            {
+                const std::string name = reg == 32u ? "acc" : "f" + std::to_string(reg);
+                const std::string where = reg == 32u ? "vu.m_state.acc" : "vu.m_state.vf[" + std::to_string(reg) + "]";
+                if (shared.vfUsed[reg])
+                {
+                    regs += "V " + name + " = vdupq_n_f32(0.0f); ";
+                    load += name + " = vld1q_f32(" + where + "); ";
+                }
+                if (shared.vfWritten[reg])
+                    store += "vst1q_f32(" + where + ", " + name + "); ";
+            }
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+            {
+                if (shared.viUsed[reg])
+                {
+                    std::snprintf(one, sizeof(one), "int32_t i%u = 0; ", reg);
+                    regs += one;
+                    std::snprintf(one, sizeof(one), "i%u = vu.m_state.vi[%u]; ", reg, reg);
+                    load += one;
+                }
+                if (shared.viWritten[reg])
+                {
+                    std::snprintf(one, sizeof(one), "vu.m_state.vi[%u] = i%u; ", reg, reg);
+                    store += one;
+                }
+            }
+            function += "#if defined(__aarch64__)\n#define VU_REGS " + regs + "\n#define VU_LOAD " + load + "\n#define VU_STORE " + store +
+                              "\n#else\n#define VU_REGS\n#define VU_LOAD\n#define VU_STORE\n#endif\n";
+        }
+        function += text;
+        function += body;
+        function += "            default:\n                return R::NotHandled;\n            }\n        }\n    }\n"
+                          "#undef VU_REGS\n#undef VU_LOAD\n#undef VU_STORE\n\n";
+        {
+            char declaration[160];
+            std::snprintf(declaration, sizeof(declaration), "    static R %s%u_%016llx(VU1Interpreter &vu, uint32_t codeSize, VU_BLOCK_PARAMS);\n",
+                          isProgram ? "prog" : "image", unit, static_cast<unsigned long long>(hash));
+            declarations += declaration;
+            functions.emplace_back(count, std::move(function));
+        }
         if (isProgram)
         {
             std::snprintf(text, sizeof(text), "        {%uu, 0x%04xu, 0x%04xu, 0x%016llxull, 0x%016llxull, &prog%u_%016llx},\n",
@@ -426,20 +599,54 @@ int main(int argc, char **argv)
                  emittedImages.size(), totalPairs, pairIds.size());
     std::fputs(direct::runtimeHelpers(), out);
     std::fputs(pairFunctions.c_str(), out);
-    std::fputs("\n", out);
-    std::fputs(imageFunctions.c_str(), out);
+    std::fputs("\n    // One function per image or program; they are defined in black_vu1_recompiled_part<N>.cpp.\n", out);
+    std::fputs(declarations.c_str(), out);
     std::fprintf(out,
-                 "    static VU1Interpreter::RecompiledImage find(uint64_t hash, uint32_t unit)\n    {\n"
-                 "        if (unit == 0u)\n        {\n            switch (hash)\n            {\n%s            default: return nullptr;\n            }\n        }\n"
-                 "        switch (hash)\n        {\n%s        default: return nullptr;\n        }\n    }\n\n"
+                 "\n    static VU1Interpreter::RecompiledImage find(uint64_t hash, uint32_t unit);\n"
                  "    // Microprograms recognised by content at a fixed load address (unit, address, bytes, hash of the bytes,\n"
                  "    // first pair, code).\n"
                  "    struct Program { uint32_t unit, address, size; uint64_t hash, first; VU1Interpreter::RecompiledImage code; };\n"
-                 "    static const Program *programs(size_t &count)\n    {\n"
-                 "        static const Program list[] = {\n%s        {2u, 0u, 0u, 0ull, 0ull, nullptr}};\n"
-                 "        count = %zuu;\n        return list;\n    }\n};\n#undef VU_BLOCK_PARAMS\n#undef VU_BLOCK_ARGS\n",
+                 "    static const Program *programs(size_t &count);\n};\n\n"
+                 "#if !defined(PS2X_VU_RECOMPILED_PART)\n"
+                 "inline VU1Interpreter::RecompiledImage VuRecompiled::find(uint64_t hash, uint32_t unit)\n{\n"
+                 "    if (unit == 0u)\n    {\n        switch (hash)\n        {\n%s        default: return nullptr;\n        }\n    }\n"
+                 "    switch (hash)\n    {\n%s    default: return nullptr;\n    }\n}\n\n"
+                 "inline const VuRecompiled::Program *VuRecompiled::programs(size_t &count)\n{\n"
+                 "    static const Program list[] = {\n%s        {2u, 0u, 0u, 0ull, 0ull, nullptr}};\n"
+                 "    count = %zuu;\n    return list;\n}\n#undef VU_BLOCK_PARAMS\n#undef VU_BLOCK_ARGS\n#endif\n",
                  table[0].c_str(), table[1].c_str(), programTable.c_str(), programCount);
     std::fclose(out);
+    {
+        // The functions, largest first, each to the part that is lightest so far.
+        constexpr size_t kParts = 8u;
+        std::string parts[kParts];
+        uint64_t weight[kParts] = {};
+        std::stable_sort(functions.begin(), functions.end(), [](const auto &x, const auto &y) { return x.first > y.first; });
+        for (const auto &function : functions)
+        {
+            const size_t part = static_cast<size_t>(std::min_element(weight, weight + kParts) - weight);
+            parts[part] += function.second;
+            weight[part] += function.first;
+        }
+        std::string base = outputPath;
+        const size_t dot = base.rfind('.');
+        if (dot != std::string::npos)
+            base.erase(dot);
+        for (size_t part = 0; part < kParts; ++part)
+        {
+            const std::string path = base + "_part" + std::to_string(part) + ".cpp";
+            std::FILE *file = std::fopen(path.c_str(), "wb");
+            if (!file)
+            {
+                std::fprintf(stderr, "cannot write %s\n", path.c_str());
+                return 1;
+            }
+            std::fputs("// Generated by ps2x_vu1_recompile from captured VU microcode. Do not edit.\n"
+                       "#include \"ps2_vu1_recompiled_part.h\"\n#define PS2X_VU_RECOMPILED_PART 1\n#include \"black_vu1_recompiled.inc\"\n\n", file);
+            std::fputs(parts[part].c_str(), file);
+            std::fclose(file);
+        }
+    }
     std::printf("wrote %s: %zu images+programs (%zu programs), %zu pairs, %zu distinct pair bodies; FMAC flag writers %zu, still computing flags %zu; "
                 "%zu direct blocks covering %zu pairs\n",
                 outputPath, emittedImages.size(), programCount, totalPairs, pairIds.size(), flagWriters, liveWriters, directBlocks, directPairs);

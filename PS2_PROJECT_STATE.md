@@ -1204,3 +1204,99 @@ Savestate do usuário (`recomp/diagnostics/pcsx2/state01.eeMemory.bin`, rua do L
 - **Patch de 60 fps do PCSX2 do usuário:** muda só `li a0,30→60` (`0x102648`, `0x125078`) e o intervalo de vblank `2→1` (`0x12508C`, `0x1C5B10`). É o mesmo que `black_tick_rate.cpp` faz por gancho nas duas funções. Não há outras constantes de 30 Hz nesse patch.
 - **Escrita em código pela nossa HLE:** `ps2_stubs::sceMpegCreate` grava a estrutura de trabalho em `0x1717BC..0x171904`, que no ELF é código (o ponteiro vem do jogo; no PCSX2 esse trecho fica intacto no momento do savestate). Como o código é recompilado estaticamente não tem efeito, mas o ponteiro passado merece uma olhada.
 - `BLACK_WATCH_ADDR` / `BLACK_WATCH_ARM` / `BLACK_WATCH_HITS` generalizam `watch_bucket.py` para qualquer endereço.
+
+### VU1/VU0: medição honesta e cobertura direta (2026-10-11, madrugada)
+
+- **O banco de medida exagerava.** `ps2x_vu1_trace_replay --bench` incluía a restauração de memória e estado que ele
+  mesmo faz a cada execução (19 % do tempo no traço da VU1, mais da metade no da VU0). Agora imprime também
+  "without the harness": é esse o número a acompanhar. Referência no traço pesado: **1,65 ns por par** (o número
+  antigo, 2,2, era com o banco junto).
+- **Tetos medidos (não entraram no jogo):** tirar todo o registro de flags, todas as checagens de confirmação por par
+  e os blocos de hazard de entrada não muda o tempo de forma mensurável. A saturação de operandos em duas operações
+  (`vminq_s32` + `vminq_u32`) é exata e ficou, mas também não rende.
+- **Cobertura direta 95,6 % → 99,4 % (VU1) e 95,7 % → 99,7 % (VU0)**, tudo validado sem divergência nos quatro
+  traços: blocos podem começar num desvio (o valor testado vem do estado de registrador oculto quando o par anterior
+  o escreveu), blocos de 1 ou 2 pares, e o par do bit E com o seguinte fecham um bloco que devolve `Ended`.
+  `PS2X_VU_RECOMPILE_NONDIRECT=<arq>` e `PS2X_VU_RECOMPILE_BLOCKS=<arq>` no gerador listam o que ficou de fora e os
+  blocos, para cruzar com `PS2X_VU_PC_HISTOGRAM`.
+- **Tamanho dinâmico médio de bloco: 13 pares.** Cada bloco recarrega e regrava seus registradores na memória do
+  estado; é o custo que sobra. Tentativa em curso: registradores como locais da função inteira (`VU_REGS`/`VU_LOAD`/
+  `VU_STORE`, `PS2X_VU_RECOMPILE_SHARED=0` desliga). Problema: o tempo de compilação do arquivo gerado explode.
+- **VU0:** uma chamada típica tem 49 pares. Sem o banco: ~150 ns por chamada (3,1 ns por par; o console faz 3,39),
+  dos quais ~33 ns são as duas escritas em FPCR (modo de arredondamento) e ~83 ns o código gerado. `runFast` só
+  escreve FPCR se o modo já não for o da VU. `copyVu0ContextToState` não zera mais o estado inteiro a cada chamada.
+- **Armadilha de build:** o gerador (`ps2x_vu1_recompile`) liga com a biblioteca que inclui o arquivo gerado; se esse
+  arquivo estiver numa variante lenta de compilar, até reconstruir o gerador demora. Os scripts de iteração
+  restauram antes uma cópia rápida.
+
+### VU1/VU0: fecho da madrugada de 2026-10-11
+
+Números finais do `ps2x_vu1_trace_replay --engine recompiled --bench 30`, linha "without the harness" (o banco agora
+desconta a restauração de memória/estado e o `prepareReplay`, que o jogo não faz):
+
+| traço | ns por par | pares em código direto |
+|---|---|---|
+| heavy-spot (VU1) | 1,62 | 99,9 % |
+| contig (VU1) | 1,61 | 99,9 % |
+| level00 (VU1) | 1,70 | 99,9 % |
+| vu0-session (VU0), chamador no modo padrão | 2,9 (≈143 ns por chamada de 49 pares) | 99,7 % |
+| vu0-session (VU0), chamador já no modo da VU | 2,0 (≈100 ns por chamada) | 99,7 % |
+
+O console faz 3,39 ns por par (um par por ciclo a 294,9 MHz). **A meta de 1,5 ns por par na VU1 não foi atingida.**
+Do tempo sem o banco, ~87 % é o código gerado (≈1,45 ns por par) e ~13 % é apoio do runtime (progresso do XGKICK,
+`commitReadyPipelines`, esperas de hazard depois de JR, entrada/saída de `run`).
+
+O que entrou (tudo validado sem divergência nos quatro traços):
+- Blocos que começam em desvio, blocos de 1–2 pares, bloco que termina o programa no bit E, JR/JALR com o delay slot
+  (o destino vai em `jump`, `hu = 4` e a checagem completa de hazard no delay slot), operações da EFU dentro do bloco
+  (`D_efu` grava o operando no estado e chama `execLower`), WAITP.
+- **Superblocos guiados por perfil:** `PS2X_VU_RECOMPILE_PROFILE=<histogramas>` (um por traço, gerados com
+  `PS2X_VU_PC_HISTOGRAM`); um bloco só atravessa o par onde um desvio aterrissa se esse par for quente (≥ 1/2000 dos
+  pares executados). Sem o perfil o código gerado quintuplica e não compila em tempo razoável.
+- **Código gerado em 8 arquivos** (`black_vu1_recompiled_part0..7.cpp`, glob no CMake) mais o `.inc` com ajudantes,
+  declarações e tabelas: a compilação caiu de ~10 para ~5–7 min. `stepPairCall` é a entrada fora de linha de
+  `stepPair` para esses arquivos; `ps2_vu1_recompiled_part.h` reúne os includes.
+- `runFast` só escreve FPCR se o modo ainda não for o da VU, e a thread do jogo passa a rodar com FPCR.FZ (o EE não
+  tem denormais; o PCSX2 roda o EE com FTZ/DAZ pelo mesmo motivo). `PS2X_EE_KEEP_DENORMALS=1` desfaz. Com isso uma
+  chamada de microprograma da VU0 não troca mais de modo (≈30 ns a menos por chamada).
+- `ps2recomp/build_vu_recompiled.sh` gera os histogramas e passa o perfil.
+
+O que foi tentado e descartado:
+- Registradores como locais da função inteira (`PS2X_VU_RECOMPILE_SHARED=1`; o padrão do script é 0): correto no
+  desenho, mas o clang leva mais de 30 min por arquivo, mesmo em paralelo.
+- Superblocos sem perfil: 75 MB de código gerado, compilação de mais de 45 min.
+- PGO do clang no código gerado (`PS2X_VU_PROFILE_GENERATE` / `PS2X_VU_PROFILE_USE` no CMake, deixados como opção):
+  sem ganho mensurável (1,62 → 1,62).
+
+O que ainda pode render, em ordem de custo:
+1. Confirmação sob demanda: hoje cada par testa `c + k >= nc`. Tirar todos os testes rendeu ~0,1 ns por par no
+   experimento de teto. Confirmar só nos leitores de Q/P/status, nos inícios de DIV/SQRT/RSQRT/EFU e nas saídas do
+   bloco daria esse ganho de forma exata, mas mexe na ordem dos efeitos e precisa de validação cuidadosa.
+2. O apoio do runtime (13 %): `progressXgkick` e a espera completa de hazard nos quatro pares depois de cada JR.
+3. Abaixo de ~1,4 ns por par o limite passa a ser a própria conta: o laço mais quente usa 30 registradores VF mais
+   constantes, mais que os 32 registradores NEON, e faz um DIV por volta.
+
+## Reflexo das armas com triângulos brancos (2026-10-12, em aberto)
+
+Sintoma: na arma (AK, shotgun) aparecem triângulos brancos/lavados; o PCSX2 desenha normal. O paraLLEl-GS e o GS nativo
+mostram o mesmo defeito, então o erro está antes do GS.
+
+O que se sabe (savestate 3 do PCSX2 + GS dump de um quadro do PCSX2 vs dump nosso na mesma pose):
+- Cada parte da arma tem uma passada base e uma passada de reflexo (sphere map, ALPHA 0211 = Cs·Ad + Cd, textura de
+  ambiente 128x128 em TBP 11616/13984). `ps2recomp/diagnostics/gs_prims.py` lista os vértices de qualquer dump
+  (nosso ou `.gs` do PCSX2 descomprimido).
+- No PCSX2 as coordenadas s/q, t/q dessa passada ficam sempre em [0,1] (0,5 + 0,5·n). No nosso vão de -3,9 a 4,7 na
+  arma (472 de 3254 vértices fora) e há valores ~1e29 em outros objetos: normal ~8,8x maior → o reflexo "dá a volta"
+  na textura de ambiente.
+- Descartados: GS (os dois renderizadores concordam), VIF unpack, ITOF/FTOI (interpretador e recompilador),
+  EFU de comprimento/normalização, VU1 recompilada (trace da cena: 0 divergências contra o interpretador; o
+  gravado ao vivo só difere num bit sticky de underflow).
+- Corrigido no caminho: VDIV/VSQRT/VRSQRT da VU0 em modo macro (numerador de VRSQRT, |ft|, ±FLT_MAX na divisão por
+  zero) — o Black só usa VRSQRT com vf0.w, então não era a causa.
+- Ferramentas novas: `PS2X_VU_TRACE_REQUEST=<arquivo>` (o trace da VU1 começa quando o arquivo aparece),
+  `ps2x_vu1_trace_replay --packets ARQ` (pacotes XGKICK por registro), F9 + `ps2recomp/GravarCena.command`
+  (GS dump no lugar), BLACK_POSE_REF agora copia também o pitch.
+
+Próximo passo: rastrear instrução a instrução, num registro do microprograma 4e6f216d que desenha a arma, de onde vem
+o vetor que vira o ST do reflexo (matriz em constantes 0x3E5–0x3F9? normal do vértice?) e conferir esse dado contra
+o PCSX2; se a entrada já vier errada, o bug está no EE/VU0 que monta a matriz/normal.

@@ -52,6 +52,10 @@ if [[ "${1:-}" != "--skip-recomp" ]]; then
     cp "$OUT"/*.h "$RUNNER_INC"/
 fi
 
+# The EE functions go to the runner rewritten for speed (program counter and delay-slot state kept in locals,
+# inline checkpoint, restrict); recomp/output keeps the recompiler's own output. See ee_postprocess.py.
+python3 "$ROOT/ps2recomp/ee_postprocess.py" "$OUT" "$RUNNER_SRC"
+
 cp "$ROOT"/ps2recomp/overrides/*.cpp "$RUNNER_SRC"/
 for f in "$ROOT"/ps2recomp/overrides/*.cpp; do mv "$RUNNER_SRC/$(basename "$f")" "$RUNNER_SRC/zz_$(basename "$f")"; done
 

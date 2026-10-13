@@ -141,6 +141,8 @@ int main(int argc, char **argv)
     unsigned every = 1, maxFrames = ~0u, loops = 1;
     int tolerance = 0;
     bool quantize = false;
+    unsigned vramFrame = ~0u;
+    std::string vramPath;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -161,6 +163,13 @@ int main(int argc, char **argv)
             tolerance = std::atoi(next());
         else if (arg == "--quantize")
             quantize = true;
+        else if (arg == "--vram")
+        {
+            // --vram FRAME FILE: the renderer's whole VRAM (4 MiB, as the module's read() returns it) when that
+            // scanout is reached, to look at a buffer that is not displayed.
+            vramFrame = unsigned(std::atoi(next()));
+            vramPath = next();
+        }
         else if (arg == "--diff")
         {
             diffA = next();
@@ -285,6 +294,17 @@ int main(int argc, char **argv)
                 request.rgba = pixels.data();
                 request.stride = 2560u * 4u;
                 request.maxHeight = 2048u;
+                if (loop == 0 && frame == vramFrame && !vramPath.empty())
+                {
+                    std::vector<uint8_t> vram(4u * 1024u * 1024u);
+                    api->wait(gpu);
+                    api->read(gpu, 0u, vram.data(), uint32_t(vram.size()));
+                    if (std::FILE *file = std::fopen(vramPath.c_str(), "wb"))
+                    {
+                        std::fwrite(vram.data(), 1, vram.size(), file);
+                        std::fclose(file);
+                    }
+                }
                 const bool shown = api->scanout(gpu, &request) != 0 && request.width != 0u && request.height != 0u;
                 if (loop == 0)
                 {

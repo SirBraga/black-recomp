@@ -9,9 +9,15 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#define XXH_INLINE_ALL
+#include "third_party/xxhash.h"
+#include "texture_replace.h"
+#import <ImageIO/ImageIO.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include "gs_decode.h"
 #include "runtime/gs/gs_parallel_api.h"
 
+#include <atomic>
 #include <algorithm>
 #include <bitset>
 #include <cstdio>
@@ -19,6 +25,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Sits above the window's own content and lets every event through to it.
@@ -31,6 +38,14 @@
     return nil;
 }
 @end
+
+struct PassTime { double seconds = 0.0; uint64_t passes = 0, draws = 0; };
+static std::mutex g_passTimeMutex;
+static std::map<uint64_t, PassTime> g_passTime;
+static std::atomic<uint64_t> g_gpuNanoseconds{0};
+// When frames really reached the screen (the drawable's presented time): how many came more than a vertical blank and
+// a half after the one before, and the longest gap, since the last report.
+static std::atomic<uint64_t> g_lastPresented{0}, g_presentLate{0}, g_presentWorst{0}, g_presented{0};
 
 namespace
 {
@@ -67,6 +82,9 @@ namespace
         float lodScale, lodK;           // 1 << L and K
         float pointSize;
         uint32_t paletteScale; // texels of the palette texture per palette entry (a palette copied from an upscaled target)
+        uint32_t texBox;       // texels of the bound texture per texel the game sees, when it filters a larger render target
+        uint32_t texSelf;      // the texel is the very pixel being drawn (the batch re-reads its own target in place)
+        uint32_t texReplaced;  // the bound texture is a replacement pack texture: full-range alpha, hardware mip level
     };
 
     struct ShuffleUniforms
@@ -97,7 +115,49 @@ struct Uniforms
     float lodScale, lodK;
     float pointSize;
     uint paletteScale;
+    uint texBox;
+    uint texSelf;
+    uint texReplaced;
 };
+
+// GS_SPECIALIZED: the fields that pick a code path come from function constants, one compiled variant per
+// combination in use (the generic build reads them from the uniforms and decides per pixel).
+#if defined(GS_SPECIALIZED)
+constant uint k_tme [[function_constant(0)]];
+constant uint k_tfx [[function_constant(1)]];
+constant uint k_tcc [[function_constant(2)]];
+constant uint k_fge [[function_constant(3)]];
+constant uint k_abe [[function_constant(4)]];
+constant uint k_blendA [[function_constant(5)]];
+constant uint k_blendB [[function_constant(6)]];
+constant uint k_blendC [[function_constant(7)]];
+constant uint k_blendD [[function_constant(8)]];
+constant uint k_atst [[function_constant(9)]];
+constant uint k_alphaMode [[function_constant(10)]];
+constant uint k_writeMode [[function_constant(11)]];
+constant uint k_fba [[function_constant(12)]];
+constant uint k_colclamp [[function_constant(13)]];
+constant uint k_destinationHasAlpha [[function_constant(14)]];
+constant uint k_texAlphaFixed [[function_constant(15)]];
+constant uint k_texIndexed [[function_constant(16)]];
+constant uint k_texLinear [[function_constant(17)]];
+constant uint k_wrapU [[function_constant(18)]];
+constant uint k_wrapV [[function_constant(19)]];
+constant uint k_texBox [[function_constant(20)]];
+constant uint k_texSelf [[function_constant(21)]];
+constant uint k_hasLevels [[function_constant(22)]];
+constant uint k_lodFixed [[function_constant(23)]];
+constant uint k_hasMask [[function_constant(24)]];
+#define S(field) k_##field
+#define HAS_LEVELS (k_hasLevels != 0)
+#define LOD_FIXED (k_lodFixed != 0)
+#define HAS_MASK (k_hasMask != 0)
+#else
+#define S(field) u.field
+#define HAS_LEVELS (u.maxLevel != 0)
+#define LOD_FIXED (u.lodFixed != 0)
+#define HAS_MASK (u.fbmask != 0)
+#endif
 
 struct ShuffleUniforms
 {
@@ -212,31 +272,48 @@ fragment DepthAndColorOut depthCopyClearFragment(VertexOut in [[stage_in]], dept
     return out;
 }
 
-fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[color(0)]], texture2d<float> tex [[texture(0)]], texture2d<float> palette [[texture(1)]],
-                             sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(1)]])
+static float4 shade(VertexOut in, float4 destination, texture2d<float> tex, texture2d<float> palette, sampler smp, constant Uniforms &u)
 {
+#if defined(GS_TRIVIAL)
+    return float4(in.color.rgb / 255.0, 1.0); // PS2X_GS_NATIVE_TRIVIAL=1: what rasterizing alone costs (diagnostic)
+#endif
     // Everything below is in GS units: 0..255 per channel, alpha 128 meaning 1.0.
     float4 c = floor(in.color);
-    if (u.tme != 0)
+    if (S(tme) != 0)
     {
         float2 coordinate = in.stq.xy / in.stq.z;
-        if (u.wrapU >= 2 || u.wrapV >= 2)
+        if (S(wrapU) >= 2 || S(wrapV) >= 2)
         {
             // Region modes work on texel coordinates: clamp to [MIN, MAX], or (texel & MIN) | MAX (unfiltered).
             float2 texel = coordinate * float2(u.texWidth, u.texHeight);
-            if (u.wrapU == 2) texel.x = clamp(texel.x, u.minU + 0.5, u.maxU + 0.5);
-            else if (u.wrapU == 3) texel.x = float((int(floor(texel.x)) & int(u.minU)) | int(u.maxU)) + 0.5;
-            if (u.wrapV == 2) texel.y = clamp(texel.y, u.minV + 0.5, u.maxV + 0.5);
-            else if (u.wrapV == 3) texel.y = float((int(floor(texel.y)) & int(u.minV)) | int(u.maxV)) + 0.5;
+            if (S(wrapU) == 2) texel.x = clamp(texel.x, u.minU + 0.5, u.maxU + 0.5);
+            else if (S(wrapU) == 3) texel.x = float((int(floor(texel.x)) & int(u.minU)) | int(u.maxU)) + 0.5;
+            else if (S(wrapU) == 4) texel.x = fract(coordinate.x) * u.texWidth;
+            if (S(wrapV) == 2) texel.y = clamp(texel.y, u.minV + 0.5, u.maxV + 0.5);
+            else if (S(wrapV) == 3) texel.y = float((int(floor(texel.y)) & int(u.minV)) | int(u.maxV)) + 0.5;
+            else if (S(wrapV) == 4) texel.y = fract(coordinate.y) * u.texHeight;
             coordinate = texel / float2(u.texWidth, u.texHeight);
         }
         coordinate *= float2(u.texScaleU, u.texScaleV);
         float4 t;
-        if (u.texIndexed != 0)
+        if (S(texSelf) != 0)
+        {
+            // The game re-reads the frame in place (each pixel reads itself): that is the destination pixel, with no
+            // copy of the target and no break in the pass.
+            if (S(texIndexed) != 0)
+            {
+                uint index = uint(round(destination.a * 255.0));
+                uint entry = (index & 0xE7u) | ((index & 0x08u) << 1) | ((index & 0x10u) >> 1);
+                t = round(palette.read(uint2(entry & 15u, entry >> 4) * u.paletteScale + u.paletteScale / 2) * 255.0);
+            }
+            else
+                t = round(destination * 255.0);
+        }
+        else if (S(texIndexed) != 0)
         {
             float2 size = float2(tex.get_width(), tex.get_height());
             float2 at = coordinate * size;
-            if (u.texLinear != 0)
+            if (S(texLinear) != 0)
             {
                 at -= 0.5;
                 float2 base = floor(at), f = at - base;
@@ -251,58 +328,78 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
         {
             // The GS picks the mip level from Q, not from screen-space derivatives: (log2(1/Q) << L) + K, rounded.
             float lod = 0.0;
-            if (u.maxLevel != 0)
+            if (HAS_LEVELS)
             {
-                lod = u.lodFixed != 0 ? u.lodK : log2(1.0 / abs(in.stq.z)) * u.lodScale + u.lodK;
+                lod = LOD_FIXED ? u.lodK : log2(1.0 / abs(in.stq.z)) * u.lodScale + u.lodK;
                 lod = clamp(floor(lod + 0.5), 0.0, float(u.maxLevel));
             }
-            t = round(tex.sample(smp, coordinate, level(lod)) * 255.0);
+            if (u.texReplaced != 0)
+            {
+                // A replacement from a texture pack: its own alpha is 0..255 (opaque = 255), the GS works in 0..128.
+                t = round(tex.sample(smp, coordinate) * 255.0);
+                t.a = floor(t.a * 128.0 / 255.0 + 0.5);
+            }
+            else if (S(texBox) > 1)
+            {
+                // A render target drawn larger, read with the GS's bilinear filter: the game counts on that filter
+                // mixing neighbouring texels of its own size (it blurs by reading half a texel off). One of its
+                // texels is texBox of ours across, so the same mix is the mean over that many of our samples.
+                // Four filtered samples, a quarter of the game's texel away from the centre on each axis: together they
+                // weigh the texBox x texBox texels of ours about evenly, at any scale (texBox squared samples would be
+                // nine at 3x and sixteen at 4x, on passes that cover the whole screen).
+                float2 reach = float(S(texBox)) * 0.25 / float2(tex.get_width(), tex.get_height());
+                float4 sum = tex.sample(smp, coordinate + float2(-reach.x, -reach.y), level(0.0)) + tex.sample(smp, coordinate + float2(reach.x, -reach.y), level(0.0)) +
+                             tex.sample(smp, coordinate + float2(-reach.x, reach.y), level(0.0)) + tex.sample(smp, coordinate + float2(reach.x, reach.y), level(0.0));
+                t = round(sum * 0.25 * 255.0);
+            }
+            else
+                t = round(tex.sample(smp, coordinate, level(lod)) * 255.0);
         }
-        if (u.texAlphaFixed != 0) t.a = float(u.ta0);
+        if (S(texAlphaFixed) != 0) t.a = float(u.ta0);
         float3 modulated = min(floor(t.rgb * c.rgb / 128.0), 255.0);
-        if (u.tfx == 0)
+        if (S(tfx) == 0)
         {
             c.rgb = modulated;
-            if (u.tcc != 0) c.a = min(floor(t.a * c.a / 128.0), 255.0);
+            if (S(tcc) != 0) c.a = min(floor(t.a * c.a / 128.0), 255.0);
         }
-        else if (u.tfx == 1)
+        else if (S(tfx) == 1)
         {
             c.rgb = t.rgb;
-            if (u.tcc != 0) c.a = t.a;
+            if (S(tcc) != 0) c.a = t.a;
         }
         else
         {
             c.rgb = min(modulated + c.a, 255.0);
-            if (u.tcc != 0) c.a = u.tfx == 2 ? min(t.a + c.a, 255.0) : t.a;
+            if (S(tcc) != 0) c.a = S(tfx) == 2 ? min(t.a + c.a, 255.0) : t.a;
         }
     }
-    if (u.fge != 0)
+    if (S(fge) != 0)
     {
         float f = floor(in.fog);
         c.rgb = floor((c.rgb * f + float3(u.fogR, u.fogG, u.fogB) * (256.0 - f)) / 256.0);
     }
-    if (u.alphaMode != 0)
+    if (S(alphaMode) != 0)
     {
         float a = c.a, r = float(u.aref);
-        bool pass = u.atst == 0 ? false : u.atst == 1 ? true : u.atst == 2 ? a < r : u.atst == 3 ? a <= r : u.atst == 4 ? a == r : u.atst == 5 ? a >= r : u.atst == 6 ? a > r : a != r;
-        if (pass != (u.alphaMode == 1)) discard_fragment();
+        bool pass = S(atst) == 0 ? false : S(atst) == 1 ? true : S(atst) == 2 ? a < r : S(atst) == 3 ? a <= r : S(atst) == 4 ? a == r : S(atst) == 5 ? a >= r : S(atst) == 6 ? a > r : a != r;
+        if (pass != (S(alphaMode) == 1)) discard_fragment();
     }
     float4 d = round(destination * 255.0);
-    if (u.writeMode == 1) return destination;
+    if (S(writeMode) == 1) return destination;
     float3 rgb = c.rgb;
-    if (u.abe != 0)
+    if (S(abe) != 0)
     {
-        float3 A = u.blendA == 0 ? c.rgb : u.blendA == 1 ? d.rgb : float3(0.0);
-        float3 B = u.blendB == 0 ? c.rgb : u.blendB == 1 ? d.rgb : float3(0.0);
-        float C = u.blendC == 0 ? c.a : u.blendC == 1 ? (u.destinationHasAlpha != 0 ? d.a : 128.0) : float(u.fix);
-        float3 D = u.blendD == 0 ? c.rgb : u.blendD == 1 ? d.rgb : float3(0.0);
+        float3 A = S(blendA) == 0 ? c.rgb : S(blendA) == 1 ? d.rgb : float3(0.0);
+        float3 B = S(blendB) == 0 ? c.rgb : S(blendB) == 1 ? d.rgb : float3(0.0);
+        float C = S(blendC) == 0 ? c.a : S(blendC) == 1 ? (S(destinationHasAlpha) != 0 ? d.a : 128.0) : float(u.fix);
+        float3 D = S(blendD) == 0 ? c.rgb : S(blendD) == 1 ? d.rgb : float3(0.0);
         rgb = floor((A - B) * C / 128.0) + D;
     }
-    rgb = u.colclamp != 0 ? clamp(rgb, 0.0, 255.0) : rgb - 256.0 * floor(rgb / 256.0);
-    float alpha = u.fba != 0 && c.a < 128.0 ? c.a + 128.0 : c.a;
-    if (u.writeMode == 2) alpha = d.a;
+    rgb = S(colclamp) != 0 ? clamp(rgb, 0.0, 255.0) : rgb - 256.0 * floor(rgb / 256.0);
+    float alpha = S(fba) != 0 && c.a < 128.0 ? c.a + 128.0 : c.a;
+    if (S(writeMode) == 2) alpha = d.a;
     uint4 o = uint4(float4(rgb, clamp(alpha, 0.0, 255.0)));
-    if (u.fbmask != 0)
+    if (HAS_MASK)
     {
         uint packed = o.r | (o.g << 8) | (o.b << 16) | (o.a << 24);
         uint4 di = uint4(d);
@@ -311,6 +408,21 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
         o = uint4(packed & 255, (packed >> 8) & 255, (packed >> 16) & 255, packed >> 24);
     }
     return float4(o) / 255.0;
+}
+
+// Reads the pixel it writes to (programmable blending): for everything the GS mixes with or masks against the frame.
+fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[color(0)]], texture2d<float> tex [[texture(0)]], texture2d<float> palette [[texture(1)]],
+                             sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(1)]])
+{
+    return shade(in, destination, tex, palette, smp, u);
+}
+
+// The same without that read, for draws that just replace the pixel (no blending, no write mask, not the
+// second pass of an alpha test): the GPU can then drop hidden fragments instead of shading every layer in order.
+fragment float4 fragmentOpaque(VertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]], texture2d<float> palette [[texture(1)]],
+                               sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(1)]])
+{
+    return shade(in, float4(0.0), tex, palette, smp, u);
 }
 )MSL";
 
@@ -330,11 +442,22 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 return false;
             queue = [device newCommandQueue];
             NSError *error = nil;
-            id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource] options:nil error:&error];
+            MTLCompileOptions *compileOptions = [MTLCompileOptions new];
+            if (std::getenv("PS2X_GS_NATIVE_TRIVIAL"))
+                compileOptions.preprocessorMacros = @{@"GS_TRIVIAL" : @1};
+            id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource] options:compileOptions error:&error];
             if (!library)
             {
                 std::fprintf(stderr, "[native-gs] shader: %s\n", error.localizedDescription.UTF8String);
                 return false;
+            }
+            if (!std::getenv("PS2X_GS_NATIVE_GENERIC_SHADER") && !std::getenv("PS2X_GS_NATIVE_TRIVIAL"))
+            {
+                MTLCompileOptions *specializedOptions = [MTLCompileOptions new];
+                specializedOptions.preprocessorMacros = @{@"GS_SPECIALIZED" : @1};
+                specializedLibrary = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource] options:specializedOptions error:&error];
+                if (!specializedLibrary)
+                    std::fprintf(stderr, "[native-gs] specialized shader: %s\n", error.localizedDescription.UTF8String);
             }
             MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
             descriptor.vertexFunction = [library newFunctionWithName:@"vertexMain"];
@@ -352,7 +475,11 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             layout.attributes[3].offset = offsetof(GpuVertex, fog);
             layout.layouts[0].stride = sizeof(GpuVertex);
             descriptor.vertexDescriptor = layout;
+            baseDescriptor = [descriptor copy];
             pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            descriptor.fragmentFunction = [library newFunctionWithName:@"fragmentOpaque"];
+            opaquePipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            descriptor.fragmentFunction = [library newFunctionWithName:@"fragmentMain"];
             if (!pipeline)
             {
                 std::fprintf(stderr, "[native-gs] pipeline: %s\n", error.localizedDescription.UTF8String);
@@ -392,6 +519,8 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             // PS2X_GS_NATIVE_SCALE=<1..8>: internal resolution, as a multiple of the game's own.
             if (const char *wanted = std::getenv("PS2X_GS_NATIVE_SCALE"))
                 scale = uint32_t(std::clamp(std::atoi(wanted), 1, 8));
+            if (const char *narrow = std::getenv("PS2X_GS_NATIVE_SCALE_NARROW"); narrow && narrow[0] == '0')
+                scaleMinWidth = 8;
             std::fprintf(stderr, "[native-gs] Metal renderer on %s\n", device.name.UTF8String);
             return true;
         }
@@ -472,7 +601,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 std::swap(first.y, second.y);
                 std::swap(first.t, second.t);
             }
-            if (scale > 1u && second.x > first.x && second.y > first.y)
+            if (scaleOf(uint32_t(batch.ctx.frame >> 16) & 0x3Fu) > 1u && second.x > first.x && second.y > first.y)
             {
                 // The GS samples pixels at integer coordinates, so a sprite from x0 to x1 fills the pixels x0..x1-1: the
                 // area half a pixel up and to the left of its outline. At the game's resolution both readings pick the same
@@ -631,6 +760,18 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             return sum;
         }
 
+        uint64_t scanoutCount() const { return scanouts; }
+        void flushRequested()
+        {
+            ++flushRequests;
+            static const bool eager = std::getenv("PS2X_GS_NATIVE_EAGER_FLUSH") != nullptr;
+            if (eager || drawCalls - drawsAtCommit >= 400u)
+            {
+                drawsAtCommit = drawCalls;
+                flush(false);
+            }
+        }
+
         void flush(bool wait)
         {
             closeBatch();
@@ -678,6 +819,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             closeBatch();
             // A buffer nothing was drawn to (a video frame sent by the CPU) becomes a target fed from VRAM.
             Target &shown = target(fbp, fbw, psm);
+            const uint32_t scale = scaleOf(fbw);
             shown.usedRows = std::max(shown.usedRows, std::min(dby + height, kTargetHeight));
             refreshTarget(shown, shown.psm);
             width = std::min(width, fbw * 64u - std::min(dbx, fbw * 64u));
@@ -703,11 +845,27 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             [quad setFragmentBytes:uniforms length:sizeof(uniforms) atIndex:1];
             [quad drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [quad endEncoding];
+            [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+              const uint64_t at = uint64_t(shown.presentedTime * 1e9);
+              if (at == 0u)
+                  return; // never shown
+              const uint64_t before = g_lastPresented.exchange(at, std::memory_order_relaxed);
+              if (before != 0u && at > before)
+              {
+                  const uint64_t gap = at - before;
+                  g_presented.fetch_add(1u, std::memory_order_relaxed);
+                  if (gap > 26000000u) // more than three refreshes of a 120 Hz screen: a frame's worth of delay at 60
+                      g_presentLate.fetch_add(1u, std::memory_order_relaxed);
+                  uint64_t worst = g_presentWorst.load(std::memory_order_relaxed);
+                  while (gap > worst && !g_presentWorst.compare_exchange_weak(worst, gap, std::memory_order_relaxed)) {}
+              }
+            }];
             [commandBuffer presentDrawable:drawable];
             flush(false);
             request.width = width;
             request.height = height;
             ++scanouts;
+            noteScanout();
             return 1;
         }
 
@@ -744,6 +902,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 height = std::min(height, kTargetHeight - std::min(dby, kTargetHeight));
                 if (width == 0u || height == 0u)
                     return 0;
+                const uint32_t scale = scaleOf(fbw);
                 if (scale == 1u)
                     [target.color getBytes:request.rgba bytesPerRow:width * 4u fromRegion:MTLRegionMake2D(dbx, dby, width, height) mipmapLevel:0];
                 else if (width * scale * 4u <= request.stride && height * scale <= request.maxHeight)
@@ -795,8 +954,12 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             request.width = width;
             request.height = height;
             ++scanouts;
+            noteScanout();
             if (stats && scanouts % 60u == 0u)
             {
+                std::fprintf(stderr, "[native-gs] gpu=%.2f ms/scanout passes=%.1f/scanout\n", double(g_gpuNanoseconds.load()) / 1e6 / double(std::max<uint64_t>(scanouts, 1)), double(passes) / double(std::max<uint64_t>(scanouts, 1)));
+                if (replPack.size() != 0)
+                    std::fprintf(stderr, "[texrepl] packs=%zu lookups=%llu hits=%llu (+mips %llu) loaded=%zu (%.0f MB) failures=%llu\n", replPack.size(), (unsigned long long)replLookups, (unsigned long long)replHitsBase, (unsigned long long)replHitsMips, replCache.size(), double(replBytes) / 1048576.0, (unsigned long long)replLoadFailures);
                 std::fprintf(stderr, "[native-gs] drawn=%llu skipped: depth-format target=%llu aliased target=%llu lines/points=%llu ztest never=%llu | draws=%llu readbacks=%llu palette copies=%llu uploads skipped=%llu textures=%zu decoded=%llu (no upload %llu, changed since %llu, mips elsewhere %llu) reused=%llu targets=%zu target-as-texture=%llu (own target %llu)\n",
                              (unsigned long long)drawn, (unsigned long long)skipped[SkipDepthTarget], (unsigned long long)skipped[SkipAliasedTarget], (unsigned long long)skipped[SkipLinesPoints],
                              (unsigned long long)skipped[SkipNever], (unsigned long long)drawCalls, (unsigned long long)readbacks, (unsigned long long)drawnPaletteCopies, (unsigned long long)uploadsSkipped, textures.size(), (unsigned long long)decodes, (unsigned long long)unknownNoUpload, (unsigned long long)unknownChanged, (unsigned long long)unknownMips, (unsigned long long)contentHits, targets.size(), (unsigned long long)targetSamples, (unsigned long long)selfSamples);
@@ -846,7 +1009,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             uint32_t mode = 0;
             uint64_t texa = 0, fogcol = 0, colclamp = 0, texclut = 0;
             float offsetX = 0.0f, offsetY = 0.0f, texelU = 1.0f, texelV = 1.0f, maxY = 0.0f, maxX = 0.0f;
-            bool gouraud = false, fst = false, textured = false, skip = false, depthCopy = false, shuffle = false;
+            bool gouraud = false, fst = false, textured = false, skip = false, depthCopy = false, shuffle = false, selfFetch = false;
             uint32_t shuffleSource = 0, shuffleDestination = 0;
             SkipReason skipReason = SkipNone;
             uint32_t firstVertex = 0, vertexCount = 0, logged = 0, primitives = 0;
@@ -854,6 +1017,44 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
 
         id<MTLDevice> device = nil;
         id<MTLCommandQueue> queue = nil;
+        id<MTLRenderPipelineState> opaquePipeline = nil, boundPipeline = nil;
+        // One pipeline per combination of the path-selecting state (see GS_SPECIALIZED in the shader): compiled in the
+        // background the first time the combination is drawn, the generic pipeline standing in until it is ready.
+        id<MTLLibrary> specializedLibrary = nil;
+        MTLRenderPipelineDescriptor *baseDescriptor = nil;
+        struct Specialized { id<MTLRenderPipelineState> state = nil; bool requested = false; };
+        std::unordered_map<uint64_t, Specialized> specialized;
+        std::mutex specializedMutex;
+        uint64_t specializedDraws = 0, genericDraws = 0;
+        id<MTLRenderPipelineState> specializedPipeline(const Uniforms &u, bool opaque)
+        {
+            if (!specializedLibrary)
+                return nil;
+            const uint32_t values[25] = {u.tme, u.tfx, u.tcc, u.fge, u.abe, u.blendA, u.blendB, u.blendC, u.blendD, u.atst, u.alphaMode, u.writeMode, u.fba, u.colclamp,
+                                         u.destinationHasAlpha, u.texAlphaFixed, u.texIndexed, u.texLinear, u.wrapU, u.wrapV, u.texBox, u.texSelf,
+                                         u.maxLevel != 0u ? 1u : 0u, u.lodFixed != 0u ? 1u : 0u, u.fbmask != 0u ? 1u : 0u};
+            uint64_t key = opaque ? 1u : 0u;
+            for (uint32_t value : values)
+                key = key * 11u + std::min(value, 10u);
+            std::lock_guard<std::mutex> lock(specializedMutex);
+            Specialized &entry = specialized[key];
+            if (entry.state || entry.requested)
+                return entry.state;
+            entry.requested = true;
+            MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+            [constants setConstantValues:values type:MTLDataTypeUInt withRange:NSMakeRange(0, 25)];
+            NSError *error = nil;
+            MTLRenderPipelineDescriptor *descriptor = [baseDescriptor copy];
+            descriptor.fragmentFunction = [specializedLibrary newFunctionWithName:opaque ? @"fragmentOpaque" : @"fragmentMain" constantValues:constants error:&error];
+            if (!descriptor.fragmentFunction)
+                return nil;
+            Renderer *self = this;
+            [device newRenderPipelineStateWithDescriptor:descriptor completionHandler:^(id<MTLRenderPipelineState> state, NSError *) {
+              std::lock_guard<std::mutex> ready(self->specializedMutex);
+              self->specialized[key].state = state;
+            }];
+            return nil;
+        }
         id<MTLRenderPipelineState> pipeline = nil, depthCopyPipeline = nil, depthCopyClearPipeline = nil, shufflePipeline = nil, presentPipeline = nil, resolvePipeline = nil;
         BlackNativeGSView *presentView = nil;
         CAMetalLayer *presentLayer = nil;
@@ -894,7 +1095,20 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
         Batch batch;
         bool batchOpen = false, stats = false;
         uint32_t scale = 1;
+        // Every buffer is drawn larger, and a larger buffer read back with the bilinear filter is averaged over the
+        // game's own texel size (texBox in the shader), which keeps the blur the game makes by reading half a texel
+        // off (light shafts, glow, smoke: 160 wide buffers). PS2X_GS_NATIVE_SCALE_NARROW=0 instead keeps buffers
+        // narrower than a screen (fbw < 8) at the game's size: exact, but blocky next to the enlarged scene.
+        uint32_t scaleMinWidth = 0;
+        uint32_t scaleOf(uint32_t fbw) const { return fbw >= scaleMinWidth ? scale : 1u; }
         id<MTLTexture> resolveTexture = nil;
+        uint64_t passes = 0, passDrawsStart = 0;
+        bool passTimes = std::getenv("PS2X_GS_NATIVE_PASS_TIMES") != nullptr;
+        uint64_t flushRequests = 0, drawsAtCommit = 0, windowFlushes = 0;
+        bool noOpaque = std::getenv("PS2X_GS_NATIVE_NO_OPAQUE") != nullptr; // every draw through the destination-reading shader
+        bool noSelfFetch = std::getenv("PS2X_GS_NATIVE_NO_SELF_FETCH") != nullptr; // in-place reads through a copy, as before
+        bool splitting = false; // closeBatch() is drawing the primitives of a self-sampling batch one by one
+        bool statsEnabled = std::getenv("PS2X_GS_NATIVE_STATS") != nullptr;
         uint64_t drawn = 0, skipped[SkipCount] = {}, drawCalls = 0, decodes = 0, scanouts = 0, targetSamples = 0, selfSamples = 0, contentHits = 0, unknownNoUpload = 0, unknownChanged = 0, unknownMips = 0;
 
         bool logging() const
@@ -1019,11 +1233,50 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             return out;
         }
 
+        // GPU time per scanout, watched in windows of 120: when the GPU needed more than a vertical blank for some of
+        // them, a line goes to stderr with the "[black-fps]" tag the launcher keeps in recomp/diagnostics/hitches.log
+        // (the game's own counters do not see a late GPU: it hands every frame over on time).
+        uint64_t windowGpu = 0, windowWorst = 0, windowLate = 0, windowCount = 0, lastGpu = 0, windowPasses = 0, windowDraws = 0, windowPrimitives = 0, windowCopies = 0;
+        void noteScanout()
+        {
+            const uint64_t total = g_gpuNanoseconds.load(std::memory_order_relaxed), spent = total - lastGpu;
+            lastGpu = total;
+            windowGpu += spent;
+            windowWorst = std::max(windowWorst, spent);
+            windowLate += spent > 16000000u ? 1u : 0u;
+            if (++windowCount < 120u)
+                return;
+            // On screen: frames that came more than 25 ms after the one before them are the ones the eye sees.
+            const uint64_t shown = g_presented.exchange(0u), late = g_presentLate.exchange(0u), gap = g_presentWorst.exchange(0u);
+            if (late != 0u || statsEnabled)
+                std::fprintf(stderr, "[black-fps] gpu: %llu of %llu frames reached the screen late (longest gap %.1f ms) | GPU mean %.1f ms, %llu of 120 scanouts over 16 ms | per scanout: %.0f passes, %.0f flush requests, %.0f draws, %.0f primitives, %.1f copies of a target | scale %u\n",
+                             (unsigned long long)late, (unsigned long long)shown, double(gap) / 1e6, double(windowGpu) / 120e6, (unsigned long long)windowLate, double(passes - windowPasses) / 120.0, double(flushRequests - windowFlushes) / 120.0,
+                             double(drawCalls - windowDraws) / 120.0, double(drawn - windowPrimitives) / 120.0, double(selfSamples - windowCopies) / 120.0, scale);
+            windowGpu = windowWorst = windowLate = windowCount = 0;
+            windowPasses = passes;
+            windowFlushes = flushRequests;
+            windowDraws = drawCalls;
+            windowPrimitives = drawn;
+            windowCopies = selfSamples;
+        }
+
         void ensureCommandBuffer()
         {
             if (commandBuffer)
                 return;
             commandBuffer = [queue commandBuffer];
+            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                    // Command buffers overlap on the GPU (the next one starts while this one is still finishing): the
+                    // time is counted once, as the union of their intervals, or the sum would say the GPU is busier than
+                    // it is.
+                    static std::mutex busyMutex;
+                    static double busyUntil = 0.0;
+                    std::lock_guard<std::mutex> lock(busyMutex);
+                    const double begin = std::max(done.GPUStartTime, busyUntil), end = done.GPUEndTime;
+                    if (end > begin)
+                        g_gpuNanoseconds.fetch_add(uint64_t((end - begin) * 1e9), std::memory_order_relaxed);
+                    busyUntil = std::max(busyUntil, end);
+                }];
         }
 
         void endPass()
@@ -1032,6 +1285,23 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             {
                 [encoder endEncoding];
                 encoder = nil;
+                // PS2X_GS_NATIVE_PASS_TIMES=1 (diagnostic, slow): every pass in a command buffer of its own, so the GPU
+                // time of each can be read; the totals per target are printed at the end.
+                if (passTimes && commandBuffer)
+                {
+                    const uint64_t key = passTarget;
+                    const uint64_t draws = drawCalls - passDrawsStart;
+                    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                      std::lock_guard<std::mutex> lock(g_passTimeMutex);
+                      PassTime &entry = g_passTime[key];
+                      entry.seconds += done.GPUEndTime - done.GPUStartTime;
+                      entry.passes += 1;
+                      entry.draws += draws;
+                    }];
+                    [commandBuffer commit];
+                    lastCommitted = commandBuffer;
+                    commandBuffer = nil;
+                }
             }
             passTarget = passDepth = ~0ull;
         }
@@ -1057,6 +1327,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             Target &entry = targets[targetKey(fbp, fbw)];
             if (!entry.color)
             {
+                const uint32_t scale = scaleOf(fbw);
                 MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:fbw * 64u * scale height:kTargetHeight * scale mipmapped:NO];
                 descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
                 descriptor.storageMode = MTLStorageModeShared;
@@ -1082,6 +1353,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             for (uint32_t page = 0; page < pages; ++page)
                 if (target.stale.test(page) && (page / target.fbw + 1u) * pageHeight <= kTargetHeight)
                     ++count;
+            const uint32_t scale = scaleOf(target.fbw);
             const uint32_t stride = 64u * scale, rows = pageHeight * scale;
             const size_t pageBytes = size_t(stride) * rows * 4u;
             id<MTLBuffer> staging = count != 0u ? [device newBufferWithLength:pageBytes * count options:MTLResourceStorageModeShared] : nil;
@@ -1121,6 +1393,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             id<MTLTexture> __strong &texture = entry.texture;
             if (!texture)
             {
+                const uint32_t scale = scaleOf(fbw);
                 MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:fbw * 64u * scale height:kTargetHeight * scale mipmapped:NO];
                 descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
                 descriptor.storageMode = MTLStorageModePrivate;
@@ -1165,13 +1438,214 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             {
                 MTLSamplerDescriptor *descriptor = [MTLSamplerDescriptor new];
                 descriptor.minFilter = descriptor.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-                descriptor.mipFilter = MTLSamplerMipFilterNearest;
+                descriptor.mipFilter = MTLSamplerMipFilterLinear;
+                if (linear)
+                    descriptor.maxAnisotropy = 8;
                 // The region modes resolve the coordinate in the shader; the sampler only has to stay out of the way.
                 descriptor.sAddressMode = wrapU != 0u ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
                 descriptor.tAddressMode = wrapV != 0u ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
                 state = [device newSamplerStateWithDescriptor:descriptor];
             }
             return state;
+        }
+
+        // ---- texture replacement packs (PS2X_TEXTURE_PACKS), same naming and hashes as PCSX2 ----
+        texrepl::Pack replPack;
+        struct ReplEntry
+        {
+            id<MTLTexture> texture = nil; // nil: the file could not be used, do not try again
+            size_t bytes = 0;
+            uint64_t lastUse = 0;
+        };
+        std::unordered_map<texrepl::Key, ReplEntry, texrepl::KeyHash> replCache;
+        std::unordered_set<const void *> replacedTextures;
+        std::unordered_set<texrepl::Key, texrepl::KeyHash> replLogged;
+        size_t replBytes = 0, replBudget = 2048ull << 20;
+        uint64_t replClock = 0, replLookups = 0, replHitsBase = 0, replHitsMips = 0, replLoadFailures = 0;
+        bool replLog = false, replReady = false;
+
+        void initReplacements()
+        {
+            if (replReady)
+                return;
+            replReady = true;
+            if (const char *dirs = std::getenv("PS2X_TEXTURE_PACKS"))
+                replPack.scan(dirs);
+            if (const char *mb = std::getenv("PS2X_TEXTURE_CACHE_MB"))
+                replBudget = size_t(std::max(64, std::atoi(mb))) << 20;
+            replLog = std::getenv("PS2X_TEXTURE_LOG") != nullptr;
+            if (replPack.size() != 0 && ![device supportsBCTextureCompression])
+            {
+                std::fprintf(stderr, "[texrepl] this GPU has no BC texture compression: replacements disabled\n");
+                replPack = texrepl::Pack();
+            }
+        }
+
+        bool loadPng(const std::string &path, texrepl::Image &out)
+        {
+            NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+            CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+            if (!source)
+                return false;
+            CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+            CFRelease(source);
+            if (!image)
+                return false;
+            const size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+            if (w == 0 || h == 0 || w > 8192 || h > 8192)
+            {
+                CGImageRelease(image);
+                return false;
+            }
+            std::vector<uint8_t> rgba(w * h * 4);
+            CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+            CGContextRef context = CGBitmapContextCreate(rgba.data(), w, h, 8, w * 4, space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+            CGColorSpaceRelease(space);
+            if (!context)
+            {
+                CGImageRelease(image);
+                return false;
+            }
+            CGContextDrawImage(context, CGRectMake(0, 0, double(w), double(h)), image);
+            CGContextRelease(context);
+            CGImageRelease(image);
+            for (size_t i = 0; i < w * h; ++i) // back to straight alpha
+            {
+                uint8_t *p = &rgba[i * 4];
+                if (p[3] != 0 && p[3] != 255)
+                    for (int c = 0; c < 3; ++c)
+                        p[c] = uint8_t(std::min(255u, (uint32_t(p[c]) * 255u + p[3] / 2u) / p[3]));
+            }
+            texrepl::buildMips(out, uint32_t(w), uint32_t(h), std::move(rgba));
+            return true;
+        }
+
+        id<MTLTexture> loadReplacement(const texrepl::Key &key, const std::string &path)
+        {
+            ReplEntry &entry = replCache[key];
+            entry.lastUse = ++replClock;
+            if (entry.texture)
+                return entry.texture;
+            if (entry.bytes == ~size_t(0)) // failed before
+                return nil;
+            texrepl::Image image;
+            const bool dds = path.size() > 4 && (path.compare(path.size() - 4, 4, ".dds") == 0 || path.compare(path.size() - 4, 4, ".DDS") == 0);
+            if (!(dds ? texrepl::loadDds(path, image) : loadPng(path, image)))
+            {
+                entry.bytes = ~size_t(0);
+                ++replLoadFailures;
+                std::fprintf(stderr, "[texrepl] cannot load %s\n", path.c_str());
+                return nil;
+            }
+            const MTLPixelFormat format = image.format == texrepl::Image::BC1 ? MTLPixelFormatBC1_RGBA : image.format == texrepl::Image::BC3 ? MTLPixelFormatBC3_RGBA : MTLPixelFormatRGBA8Unorm;
+            MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:image.levels[0].width height:image.levels[0].height mipmapped:NO];
+            descriptor.mipmapLevelCount = image.levels.size();
+            descriptor.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+            if (!texture)
+            {
+                entry.bytes = ~size_t(0);
+                return nil;
+            }
+            for (size_t level = 0; level < image.levels.size(); ++level)
+            {
+                const texrepl::Level &lv = image.levels[level];
+                [texture replaceRegion:MTLRegionMake2D(0, 0, lv.width, lv.height) mipmapLevel:level slice:0 withBytes:image.data.data() + lv.offset bytesPerRow:lv.rowBytes bytesPerImage:0];
+            }
+            entry.texture = texture;
+            entry.bytes = image.data.size();
+            replBytes += entry.bytes;
+            replacedTextures.insert((__bridge const void *)texture);
+            // Over budget: drop the least recently used ones. Whoever still points at an evicted texture (a decoded entry, the
+            // content cache) forgets it too, so the "replaced" flag can never outlive the texture it belongs to.
+            std::vector<id<MTLTexture>> evicted;
+            while (replBytes > replBudget)
+            {
+                auto oldest = replCache.end();
+                for (auto it = replCache.begin(); it != replCache.end(); ++it)
+                    if (it->second.texture && it->second.lastUse != replClock && (oldest == replCache.end() || it->second.lastUse < oldest->second.lastUse))
+                        oldest = it;
+                if (oldest == replCache.end())
+                    break;
+                replBytes -= oldest->second.bytes;
+                evicted.push_back(oldest->second.texture);
+                replCache.erase(oldest);
+            }
+            if (!evicted.empty())
+            {
+                for (auto &kv : textures)
+                    for (id<MTLTexture> gone : evicted)
+                        if (kv.second.texture == gone)
+                        {
+                            kv.second.texture = nil;
+                            kv.second.valid = false;
+                            kv.second.hash = 0;
+                        }
+                for (auto it = contentCache.begin(); it != contentCache.end();)
+                {
+                    bool match = false;
+                    for (id<MTLTexture> gone : evicted)
+                        match = match || it->second == gone;
+                    it = match ? contentCache.erase(it) : std::next(it);
+                }
+                for (id<MTLTexture> gone : evicted)
+                    replacedTextures.erase((__bridge const void *)gone);
+            }
+            return texture;
+        }
+
+        // The replacement for an indexed texture, or nil. `indices` holds one byte per texel for each mip level.
+        id<MTLTexture> findReplacement(const std::vector<uint8_t> *indices, uint32_t levelCount, const uint32_t *palette, uint32_t entries, uint64_t tex0)
+        {
+            ++replLookups;
+            texrepl::Key key;
+            key.bits = (uint32_t(tex0 >> 20) & 0x3Fu) | ((uint32_t(tex0 >> 26) & 15u) << 6) | ((uint32_t(tex0 >> 30) & 15u) << 10);
+            key.clut = XXH3_64bits(palette, size_t(entries) * 4u);
+            // PCSX2 hashes the base level and then as many mip levels as the draw it saw used: try every prefix.
+            const std::string *path = nullptr;
+            uint32_t usedLevels = 0;
+            {
+                XXH3_state_t state;
+                XXH3_64bits_reset(&state);
+                for (uint32_t level = 0; level < levelCount && !path; ++level)
+                {
+                    XXH3_64bits_update(&state, indices[level].data(), indices[level].size());
+                    key.tex = XXH3_64bits_digest(&state);
+                    path = replPack.find(key);
+                    usedLevels = level + 1u;
+                }
+            }
+            const bool withMips = path && usedLevels > 1u;
+            if (replLog && replLogged.insert(key).second)
+                std::fprintf(stderr, "[texrepl] %s %016llx-%016llx-%08x levels=%u used=%u\n", path ? (withMips ? "hit+mips" : "hit") : "miss", (unsigned long long)key.tex, (unsigned long long)key.clut, key.bits, levelCount, usedLevels);
+            if (!path)
+            {
+                // Diagnostic: PS2X_TEXTURE_DUMP=<dir> writes the indices and palette of what found no replacement.
+                if (const char *dump = std::getenv("PS2X_TEXTURE_DUMP"))
+                {
+                    char name[512];
+                    for (uint32_t level = 0; level < levelCount; ++level)
+                    {
+                        std::snprintf(name, sizeof name, "%s/%016llx-%08x-L%u.bin", dump, (unsigned long long)key.clut, key.bits, level);
+                        if (FILE *f = std::fopen(name, "wb"))
+                        {
+                            std::fwrite(indices[level].data(), 1, indices[level].size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                    std::snprintf(name, sizeof name, "%s/%016llx-%08x-palette.bin", dump, (unsigned long long)key.clut, key.bits);
+                    if (FILE *f = std::fopen(name, "wb"))
+                    {
+                        std::fwrite(palette, 4, entries, f);
+                        std::fclose(f);
+                    }
+                }
+                return nil;
+            }
+            id<MTLTexture> texture = loadReplacement(key, *path);
+            if (texture)
+                ++(withMips ? replHitsMips : replHitsBase);
+            return texture;
         }
 
         // The texture TEX0 names, decoded from the CPU copy of VRAM into RGBA (palette applied).
@@ -1326,22 +1800,62 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 }
             }
 
+            initReplacements();
+            const bool wantIndices = paletted && replPack.size() != 0;
+            std::vector<uint8_t> indices[7];
+            const uint32_t indexMask = psm == 0x13u || psm == 0x1Bu ? 0xFFu : 0x0Fu;
             std::vector<uint32_t> pixels[7];
             uint64_t hash = 0xcbf29ce484222325ull;
             for (uint32_t level = 0; level < levelCount; ++level)
             {
                 const Level &from = levels[level];
                 pixels[level].resize(size_t(from.width) * from.height);
+                if (wantIndices)
+                    indices[level].resize(size_t(from.width) * from.height);
                 for (uint32_t y = 0; y < from.height; ++y)
                     for (uint32_t x = 0; x < from.width; ++x)
                     {
                         const uint32_t value = layout.read(vram.data(), from.tbp, from.tbw, x, y);
                         const uint32_t pixel = paletted ? palette[value & 0xFFu] : expand(value, psm, ta0, ta1, aem);
                         pixels[level][size_t(y) * from.width + x] = pixel;
+                        if (wantIndices)
+                            indices[level][size_t(y) * from.width + x] = uint8_t(value & indexMask);
                         hash = (hash ^ pixel) * 0x100000001b3ull;
                     }
             }
             ++decodes;
+            if (wantIndices && (psm == 0x13u || psm == 0x14u))
+            {
+                // PCSX2 hashes plain 8- and 4-bit textures as the raw 256-byte GS blocks, row of blocks by row of blocks (a level
+                // smaller than a block is hashed as expanded indices instead): the bytes a decoder never sees unswizzled.
+                const uint32_t blockW = psm == 0x13u ? 16u : 32u, blockH = 16u;
+                for (uint32_t level = 0; level < levelCount; ++level)
+                {
+                    const Level &from = levels[level];
+                    if (from.width < blockW || from.height < blockH)
+                        continue;
+                    std::vector<uint8_t> &raw = indices[level];
+                    raw.clear();
+                    raw.reserve(size_t(from.width / blockW) * (from.height / blockH) * 256u);
+                    for (uint32_t by = 0; by < from.height / blockH; ++by)
+                        for (uint32_t bx = 0; bx < from.width / blockW; ++bx)
+                        {
+                            const uint8_t *block = vram.data() + (layout.bitAddress(from.tbp, from.tbw, bx * blockW, by * blockH) >> 3);
+                            raw.insert(raw.end(), block, block + 256);
+                        }
+                }
+            }
+            if (wantIndices)
+            {
+                if (id<MTLTexture> replacement = findReplacement(indices, levelCount, palette, psm == 0x13u || psm == 0x1Bu ? 256u : 16u, tex0))
+                {
+                    entry.texture = replacement;
+                    entry.hash = ~0ull;
+                    if (known)
+                        contentCache[contentKey] = replacement;
+                    return replacement;
+                }
+            }
             if (!entry.texture || entry.hash != hash)
             {
                 // A texture a queued draw may still sample is never rewritten: a new one takes its place.
@@ -1378,6 +1892,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                         {
                             if ((layout.bitAddress(target.fbp * 32u, target.fbw, x, y) >> 11) != cbp)
                                 continue;
+                            const uint32_t scale = scaleOf(target.fbw);
                             id<MTLTexture> __strong &copy = drawnPalettes[cbp];
                             if (!copy || copy.width != 16u * scale)
                             {
@@ -1445,6 +1960,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             if (x1 > x0 && y1 > y0)
             {
                 [quad setRenderPipelineState:shufflePipeline];
+                const uint32_t scale = scaleOf(fbw);
                 [quad setScissorRect:(MTLScissorRect){x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale}];
                 [quad setFragmentTexture:shuffleDepth atIndex:0];
                 [quad setFragmentBytes:&u length:sizeof(u) atIndex:1];
@@ -1547,6 +2063,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                     continue;
                 target.markedRect = ~0ull;
                 const bool narrow = target.psm == 2u || target.psm == 0xAu;
+                const uint32_t scale = scaleOf(target.fbw);
                 const uint32_t pageHeight = narrow ? 64u : 32u, stride = 64u * scale, rows = pageHeight * scale;
                 const gsn::Swizzle &layout = gsn::Swizzle::of(target.psm);
                 for (uint32_t page = 0; page < target.fbw * (kTargetHeight / pageHeight) && target.fbp + page < kPages; ++page)
@@ -1605,7 +2122,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 return;
             batchOpen = false;
             // PS2X_GS_NATIVE_LOG=<scanout>: one line per batch drawn while that scanout is being built.
-            if (logging() && (batch.vertexCount != 0u || batch.skip))
+            if (logging() && !splitting && (batch.vertexCount != 0u || batch.skip))
             {
                 const gsn::Context &c = batch.ctx;
                 std::fprintf(stderr, "[draw] %s fb=%u/%u/%02x msk=%08x z=%u/%02x%s test=%05x sc=%u-%u,%u-%u %s%s", batch.skip ? "SKIP" : "    ", uint32_t(c.frame) & 0x1FFu, uint32_t(c.frame >> 16) & 0x3Fu,
@@ -1617,6 +2134,25 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 if (batch.textured)
                     std::fprintf(stderr, " tex=%u/%u/%02x %ux%u tfx=%u tcc=%u cbp=%u clamp=%x tex1=%x", uint32_t(c.tex0) & 0x3FFFu, uint32_t(c.tex0 >> 14) & 0x3Fu, uint32_t(c.tex0 >> 20) & 0x3Fu, 1u << (uint32_t(c.tex0 >> 26) & 15u),
                                  1u << (uint32_t(c.tex0 >> 30) & 15u), uint32_t(c.tex0 >> 35) & 3u, uint32_t(c.tex0 >> 34) & 1u, uint32_t(c.tex0 >> 37) & 0x3FFFu, uint32_t(c.clamp) & 15u, uint32_t(c.tex1) & 0x1FFu);
+                // Vertex colour range (RGBA bytes; 0x80 is 1.0 when modulating a texture) and the screen box, to find the
+                // primitives behind a visible defect.
+                if (chunk && batch.vertexCount)
+                {
+                    const GpuVertex *v = static_cast<const GpuVertex *>(chunk.contents) + batch.firstVertex;
+                    uint32_t lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (uint32_t i = 0; i < batch.vertexCount; ++i)
+                    {
+                        for (uint32_t c = 0; c < 4u; ++c)
+                        {
+                            const uint32_t b = (v[i].rgba >> (c * 8u)) & 0xFFu;
+                            lo[c] = std::min(lo[c], b);
+                            hi[c] = std::max(hi[c], b);
+                        }
+                        x0 = std::min(x0, v[i].x); y0 = std::min(y0, v[i].y); x1 = std::max(x1, v[i].x); y1 = std::max(y1, v[i].y);
+                    }
+                    std::fprintf(stderr, " rgba=%02x%02x%02x%02x-%02x%02x%02x%02x box=%.0f,%.0f-%.0f,%.0f", lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3], x0, y0, x1, y1);
+                }
                 std::fprintf(stderr, " verts=%u\n", batch.vertexCount);
             }
             if (batch.shuffle && batch.primitives != 0u)
@@ -1637,6 +2173,98 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             const bool zmask = ((ctx.zbuf >> 32) & 1u) != 0u;
             const uint32_t test = uint32_t(ctx.test);
 
+            // A batch that reads the target it draws to. On the GS every primitive sees what the ones before it
+            // drew, and Black counts on it: it blurs its glow buffer with twenty sprites in a row, each reading what
+            // the one before left. With one copy of the target for the whole batch nothing accumulated (the glow
+            // came out sharp, with streaks). Such a batch goes one primitive at a time, each with a fresh copy.
+            if (batch.textured && !splitting)
+            {
+                const uint32_t tbp = uint32_t(ctx.tex0) & 0x3FFFu, tbw = uint32_t(ctx.tex0 >> 14) & 0x3Fu, tpsm = uint32_t(ctx.tex0 >> 20) & 0x3Fu;
+                const uint32_t kind = batch.mode & 7u, step = kind == 6u ? 6u : kind == 0u ? 1u : kind <= 2u ? 2u : 3u;
+                if ((tbp & 31u) == 0u && tbp / 32u == fbp && tbw == fbw && (tpsm == 0u || tpsm == 1u || tpsm == 0x1Bu) && batch.vertexCount > step && chunk)
+                {
+                    // Only where it matters: a primitive starts a new group (and a new copy) when the texels it reads
+                    // include pixels that an earlier primitive of the group has drawn, judged as the GS would see it
+                    // (at the game's own resolution). The blur's sprites each read their neighbour's output, so they
+                    // go one by one; the twenty tiles that re-read the main frame in place each read only their own
+                    // pixels, and stay one group with one copy (forty copies of the whole frame per scanout otherwise).
+                    const GpuVertex *vertices = static_cast<const GpuVertex *>(chunk.contents);
+                    const float tw = float(1u << (uint32_t(ctx.tex0 >> 26) & 15u)), th = float(1u << (uint32_t(ctx.tex0 >> 30) & 15u));
+                    const bool linear = ((ctx.tex1 >> 5) & 1u) != 0u;
+                    const float shift = kind == 6u && scaleOf(fbw) > 1u ? 0.5f : 0.0f; // sprite() moved it half a pixel
+                    struct Box { int x0, y0, x1, y1; };
+                    std::vector<Box> drawn;
+                    bool identity = kind == 6u && !noSelfFetch; // every sprite maps each pixel onto itself
+                    bool fetch = false;
+                    const Batch whole = batch;
+                    const uint32_t end = whole.firstVertex + whole.vertexCount;
+                    uint32_t groupFirst = whole.firstVertex;
+                    splitting = true;
+                    const auto flushGroup = [&](uint32_t until)
+                    {
+                        if (until == groupFirst)
+                            return;
+                        batch = whole;
+                        batch.firstVertex = groupFirst;
+                        batch.vertexCount = until - groupFirst;
+                        batch.selfFetch = fetch;
+                        batchOpen = true;
+                        closeBatch();
+                        groupFirst = until;
+                        drawn.clear();
+                    };
+                    for (uint32_t first = whole.firstVertex; first + step <= end; first += step)
+                    {
+                        Box target{}, source{};
+                        if (kind == 6u)
+                        {
+                            const GpuVertex &a = vertices[first], &b = vertices[first + 5u];
+                            const float x0 = a.x + shift, x1 = b.x + shift, y0 = a.y + shift, y1 = b.y + shift;
+                            target = {int(std::ceil(x0)), int(std::ceil(y0)), int(std::ceil(x1)) - 1, int(std::ceil(y1)) - 1};
+                            // Texel coordinates at the first and last pixel the GS samples.
+                            const float u0 = a.s / a.q * tw, u1 = b.s / b.q * tw, v0 = a.t / a.q * th, v1 = b.t / b.q * th;
+                            const float du = x1 > x0 ? (u1 - u0) / (x1 - x0) : 0.0f, dv = y1 > y0 ? (v1 - v0) / (y1 - y0) : 0.0f;
+                            // (u0, v0) belong to the vertex as it was emitted, half a pixel off when the target is enlarged.
+                            float ua = u0 + (float(target.x0) - a.x) * du, ub = u0 + (float(target.x1) - a.x) * du;
+                            float va = v0 + (float(target.y0) - a.y) * dv, vb = v0 + (float(target.y1) - a.y) * dv;
+                            if (ua > ub) std::swap(ua, ub);
+                            if (va > vb) std::swap(va, vb);
+                            identity = identity && std::fabs(du - 1.0f) < 1e-4f && std::fabs(dv - 1.0f) < 1e-4f &&
+                                       std::fabs(ua - (float(target.x0) + 0.5f)) < 1e-3f && std::fabs(va - (float(target.y0) + 0.5f)) < 1e-3f;
+                            if (linear)
+                                source = {int(std::floor(ua - 0.5f)), int(std::floor(va - 0.5f)), int(std::ceil(ub - 0.5f)), int(std::ceil(vb - 0.5f))};
+                            else
+                                source = {int(std::floor(ua)), int(std::floor(va)), int(std::floor(ub)), int(std::floor(vb))};
+                        }
+                        else
+                        {
+                            identity = false;
+                            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
+                            for (uint32_t k = 0; k < step; ++k)
+                            {
+                                const GpuVertex &v = vertices[first + k];
+                                x0 = std::min(x0, v.x); x1 = std::max(x1, v.x); y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+                                const float u = v.s / v.q * tw, w = v.t / v.q * th;
+                                u0 = std::min(u0, u); u1 = std::max(u1, u); v0 = std::min(v0, w); v1 = std::max(v1, w);
+                            }
+                            target = {int(std::floor(x0)) - 1, int(std::floor(y0)) - 1, int(std::ceil(x1)) + 1, int(std::ceil(y1)) + 1};
+                            source = {int(std::floor(u0)) - 1, int(std::floor(v0)) - 1, int(std::ceil(u1)) + 1, int(std::ceil(v1)) + 1};
+                        }
+                        bool reads = false;
+                        for (const Box &box : drawn)
+                            reads = reads || (source.x0 <= box.x1 && source.x1 >= box.x0 && source.y0 <= box.y1 && source.y1 >= box.y0);
+                        if (reads)
+                            flushGroup(first);
+                        drawn.push_back(target);
+                    }
+                    fetch = identity && groupFirst == whole.firstVertex; // one group of in-place reads: no copy at all
+                    flushGroup(end);
+                    splitting = false;
+                    batch = whole;
+                    return;
+                }
+            }
+
             // Textures and stale target pages first: both may have to end the current pass.
             Target &destination = target(fbp, fbw, psm);
             {
@@ -1648,7 +2276,8 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             float texScaleU = 1.0f, texScaleV = 1.0f;
             bool texAlphaFixed = false;
             id<MTLTexture> indexPalette = nil;
-            uint32_t paletteScale = 1;
+            uint32_t paletteScale = 1, texBox = 1;
+            bool targetSource = false;
             if (batch.textured)
             {
                 const uint32_t tbp = uint32_t(ctx.tex0) & 0x3FFFu, tbw = uint32_t(ctx.tex0 >> 14) & 0x3Fu, tpsm = uint32_t(ctx.tex0 >> 20) & 0x3Fu;
@@ -1659,7 +2288,9 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                     Target &from = found->second;
                     refreshTarget(from, from.psm);
                     source = from.color;
-                    if (&from == &destination)
+                    if (&from == &destination && batch.selfFetch)
+                        source = fallbackTexture; // the shader takes the texel from the pixel it is drawing
+                    else if (&from == &destination)
                     {
                         // A pass cannot sample what it draws to: a copy of the target as it is now.
                         endPass();
@@ -1670,8 +2301,11 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                             descriptor.storageMode = MTLStorageModePrivate;
                             from.copy = [device newTextureWithDescriptor:descriptor];
                         }
+                        // Only the rows in use: this now happens once per primitive of such a batch.
+                        const NSUInteger rows = std::min<NSUInteger>(from.color.height, NSUInteger(std::max(from.usedRows, 1u)) * scaleOf(from.fbw));
                         id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-                        [blit copyFromTexture:from.color toTexture:from.copy];
+                        [blit copyFromTexture:from.color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(from.color.width, rows, 1)
+                                    toTexture:from.copy destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
                         [blit endEncoding];
                         source = from.copy;
                         ++selfSamples;
@@ -1679,6 +2313,8 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                     texScaleU = float(1u << (uint32_t(ctx.tex0 >> 26) & 15u)) / float(from.fbw * 64u);
                     texScaleV = float(1u << (uint32_t(ctx.tex0 >> 30) & 15u)) / float(kTargetHeight);
                     texAlphaFixed = tpsm == 1u;
+                    texBox = scaleOf(from.fbw);
+                    targetSource = true;
                     if (tpsm == 0x1Bu)
                         indexPalette = palette(ctx.tex0, batch.texa, paletteScale);
                     ++targetSamples;
@@ -1708,9 +2344,12 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
                 pass.depthAttachment.storeAction = MTLStoreActionStore;
                 depthTarget.fresh = false;
                 encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+                ++passes;
                 [encoder setRenderPipelineState:pipeline];
+                boundPipeline = pipeline;
                 [encoder setCullMode:MTLCullModeNone];
                 passTarget = wantedTarget;
+                passDrawsStart = drawCalls;
                 passDepth = wantedDepth;
                 boundChunk = nil;
             }
@@ -1725,6 +2364,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             const uint32_t x0 = std::min(sx0, targetWidth), x1 = std::min(sx1 + 1u, targetWidth), y0 = std::min(sy0, kTargetHeight), y1 = std::min(sy1 + 1u, kTargetHeight);
             if (x1 <= x0 || y1 <= y0)
                 return;
+            const uint32_t scale = scaleOf(fbw);
             [encoder setScissorRect:(MTLScissorRect){x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale}];
 
             Uniforms u{};
@@ -1763,17 +2403,33 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             u.maxU = float(uint32_t(ctx.clamp >> 14) & 0x3FFu);
             u.minV = float(uint32_t(ctx.clamp >> 24) & 0x3FFu);
             u.maxV = float(uint32_t(ctx.clamp >> 34) & 0x3FFu);
+            if (texBox != 0u && targetSource)
+            {
+                // The texture is a piece of a render target: the sampler's own clamping and wrapping act on the
+                // whole target, so past the edge of the texture the filter would pick up whatever was drawn next to
+                // it. Clamp and repeat are done on the texture's own size instead (a line of wrong pixels along the
+                // bottom and right edges of the glow rectangles otherwise).
+                if (u.wrapU == 1u) { u.wrapU = 2u; u.minU = 0.0f; u.maxU = u.texWidth - 1.0f; }
+                else if (u.wrapU == 0u) u.wrapU = 4u;
+                if (u.wrapV == 1u) { u.wrapV = 2u; u.minV = 0.0f; u.maxV = u.texHeight - 1.0f; }
+                else if (u.wrapV == 0u) u.wrapV = 4u;
+            }
             u.maxLevel = batch.textured && source != fallbackTexture ? uint32_t(source.mipmapLevelCount) - 1u : 0u;
             u.lodFixed = uint32_t(ctx.tex1) & 1u;
             u.lodScale = float(1u << (uint32_t(ctx.tex1 >> 19) & 3u));
             u.lodK = float(int32_t(uint32_t(ctx.tex1 >> 32) << 20) >> 20) * (1.0f / 16.0f);
             u.texIndexed = indexPalette ? 1u : 0u;
             u.texLinear = ((ctx.tex1 >> 5) & 1u) != 0u ? 1u : 0u;
+            u.texBox = u.texLinear != 0u ? texBox : 1u;
+            u.texSelf = batch.selfFetch && targetSource ? 1u : 0u;
+            u.texReplaced = batch.textured && source && replacedTextures.count((__bridge const void *)source) != 0 ? 1u : 0u;
+            if (u.texSelf != 0u)
+                u.texBox = 1u;
             [encoder setFragmentTexture:indexPalette ? indexPalette : fallbackTexture atIndex:1];
 
             if (batch.textured)
             {
-                const bool linear = ((ctx.tex1 >> 5) & 1u) != 0u;
+                const bool linear = ((ctx.tex1 >> 5) & 1u) != 0u || u.texReplaced != 0u;
                 [encoder setFragmentTexture:source atIndex:0];
                 [encoder setFragmentSamplerState:sampler(linear, uint32_t(ctx.clamp) & 3u, uint32_t(ctx.clamp >> 2) & 3u) atIndex:0];
             }
@@ -1790,6 +2446,20 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
             {
                 u.alphaMode = alphaMode;
                 u.writeMode = writeMode;
+                const bool opaque = opaquePipeline && !noOpaque && u.abe == 0u && u.fbmask == 0u && writeMode == 0u && u.texSelf == 0u;
+                id<MTLRenderPipelineState> wanted = specializedPipeline(u, opaque);
+                if (wanted)
+                    ++specializedDraws;
+                else
+                {
+                    ++genericDraws;
+                    wanted = opaque ? opaquePipeline : pipeline;
+                }
+                if (wanted != boundPipeline)
+                {
+                    [encoder setRenderPipelineState:wanted];
+                    boundPipeline = wanted;
+                }
                 [encoder setDepthStencilState:depthState(depthTest, greaterOnly, depthWrite)];
                 [encoder setVertexBytes:&u length:sizeof(u) atIndex:1];
                 [encoder setFragmentBytes:&u length:sizeof(u) atIndex:1];
@@ -1837,6 +2507,15 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
         @autoreleasepool
         {
             renderer(handle).flush(true);
+            std::lock_guard<std::mutex> lock(g_passTimeMutex);
+            const uint64_t scanouts = std::max<uint64_t>(renderer(handle).scanoutCount(), 1u);
+            for (const auto &[key, entry] : g_passTime)
+                std::fprintf(stderr, "[native-gs] target fbp=%llu fbw=%llu: %.2f ms/scanout in %.1f passes/scanout, %.0f draws/scanout\n", (unsigned long long)(key & 0xFFFFu),
+                             (unsigned long long)(key >> 16), entry.seconds * 1e3 / double(scanouts), double(entry.passes) / double(scanouts), double(entry.draws) / double(scanouts));
+        }
+        @autoreleasepool
+        {
+            renderer(handle).flush(true);
             delete &renderer(handle);
         }
     }
@@ -1860,9 +2539,17 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], float4 destination [[col
     {
         @autoreleasepool { renderer(handle).frontend.transferData(data, size); }
     }
+    // The runtime asks for a flush every time it has handed over a batch of GIF data, many times per frame. Committing
+    // each time ends the render pass, and the next draw starts another one that reloads and later stores the whole
+    // colour and depth target: at 3x that is most of the GPU time of a frame. The work is committed when it is
+    // needed instead (a scanout, a wait, a read back, a full vertex buffer), and here only when a good amount has
+    // piled up, so the GPU still starts on the frame before the scanout. PS2X_GS_NATIVE_EAGER_FLUSH=1: as before.
     void flush(void *handle)
     {
-        @autoreleasepool { renderer(handle).flush(false); }
+        @autoreleasepool
+        {
+            renderer(handle).flushRequested();
+        }
     }
     void wait(void *handle)
     {

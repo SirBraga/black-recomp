@@ -126,9 +126,9 @@ namespace
             vu.resume(code, static_cast<uint32_t>(r.code->size()), out.data.data(),
                       static_cast<uint32_t>(out.data.size()), dummyGs(), nullptr, r.top, r.itop, r.maxCycles);
         }
-        else
-            vu.execute(code, static_cast<uint32_t>(r.code->size()), out.data.data(),
-                       static_cast<uint32_t>(out.data.size()), dummyGs(), nullptr, r.startPC, r.top, r.itop, r.maxCycles);
+        else // the entry the runtime uses for VU0 calls (the same run as execute(); PS2X_VU_NO_LEAN_CALL=1 for execute() itself)
+            vu.executeMicroCall(code, static_cast<uint32_t>(r.code->size()), out.data.data(),
+                                static_cast<uint32_t>(out.data.size()), dummyGs(), nullptr, r.startPC, r.top, r.itop, r.maxCycles);
         out.pairs = vu.executedPairs() - pairsBefore;
         out.state = vu.state();
     }
@@ -225,6 +225,7 @@ int main(int argc, char **argv)
     }
     int bench = 0;
     const char *exportDir = nullptr;
+    const char *packetsPath = nullptr;
     const char *rebaselinePath = nullptr;
     int benchEngine = -1; // --bench-engine reference|fast
     int independence = 0; // --independence K: see below
@@ -238,6 +239,7 @@ int main(int argc, char **argv)
         else if (!std::strcmp(argv[i], "--engine") && i + 1 < argc) candidate = !std::strcmp(argv[++i], "recompiled") ? VU1Interpreter::Engine::Recompiled : VU1Interpreter::Engine::Fast;
         else if (!std::strcmp(argv[i], "--export") && i + 1 < argc) exportDir = argv[++i];
         else if (!std::strcmp(argv[i], "--rebaseline") && i + 1 < argc) rebaselinePath = argv[++i];
+        else if (!std::strcmp(argv[i], "--packets") && i + 1 < argc) packetsPath = argv[++i];
         else if (!std::strcmp(argv[i], "--limit") && i + 1 < argc) limit = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--independence") && i + 1 < argc) independence = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--status-mask") && i + 1 < argc) statusMask = std::strtoul(argv[++i], nullptr, 16);
@@ -366,6 +368,9 @@ int main(int argc, char **argv)
     std::map<std::pair<uint32_t, uint64_t>, std::vector<uint8_t>> coverageMaps;
     Result a, b;
     std::FILE *rebaseline = rebaselinePath ? std::fopen(rebaselinePath, "wb") : nullptr;
+    // --packets FILE: every GIF packet the reference run of each record sends (XGKICK), as
+    // [record index u32][size u32][bytes], to see what the microprograms gave the GS.
+    std::FILE *packetFile = packetsPath ? std::fopen(packetsPath, "wb") : nullptr;
     size_t fastMismatch = 0, recordedMismatch = 0;
     uint64_t pairs = 0, packets = 0;
     for (size_t n = 0; n < records.size(); ++n)
@@ -390,6 +395,13 @@ int main(int argc, char **argv)
             std::fwrite(&a.state, sizeof(VU1State), 1, rebaseline);
             std::fwrite(a.data.data(), 1, a.data.size(), rebaseline);
         }
+        if (packetFile)
+            for (const auto &packet : a.packets.list)
+            {
+                const uint32_t head[2] = {static_cast<uint32_t>(n), static_cast<uint32_t>(packet.size())};
+                std::fwrite(head, sizeof(head), 1, packetFile);
+                std::fwrite(packet.data(), 1, packet.size(), packetFile);
+            }
         runRecord(*fast, r, b);
         pairs += a.pairs; packets += a.packets.list.size();
         const std::string d = diffResult(a, b, statusMask);
@@ -452,6 +464,34 @@ int main(int argc, char **argv)
         {
             if (benchEngine >= 0 && benchEngine != engine)
                 continue;
+            // What the harness itself does around each run (restoring the data memory and the state, copying
+            // the state out) is timed alone and reported apart: the game does none of it.
+            double setup = 1e30;
+            {
+                VU1Interpreter &vu = engine == 0 ? *references[records[0].unit] : *candidates[records[0].unit];
+                for (int round = 0; round < 3; ++round)
+                {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int rep = 0; rep < bench; ++rep)
+                        for (const Record &r : records)
+                        {
+                            a.packets.list.clear();
+                            a.data = r.dataBefore;
+                            vu.state() = r.before;
+                            if (r.resumed)
+                                vu.prepareReplay(r.before); // puts the scheduler where the recording had it
+                            a.state = vu.state();
+                        }
+                    setup = std::min(setup, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                }
+            }
+#if defined(__aarch64__)
+            // PS2X_BENCH_VU_FPCR=1: the caller already runs in the VU's floating-point mode (round toward zero,
+            // flush to zero), as a thread that keeps that mode would.
+            const uint64_t fpcrBefore = __builtin_arm_rsr64("FPCR");
+            if (std::getenv("PS2X_BENCH_VU_FPCR"))
+                __builtin_arm_wsr64("FPCR", fpcrBefore | (uint64_t{3} << 22) | (uint64_t{1} << 24));
+#endif
             double best = 1e30;
             for (int round = 0; round < 3; ++round)
             {
@@ -461,9 +501,16 @@ int main(int argc, char **argv)
                         runRecord(engine == 0 ? *references[r.unit] : *candidates[r.unit], r, a);
                 best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             }
+#if defined(__aarch64__)
+            __builtin_arm_wsr64("FPCR", fpcrBefore);
+#endif
             std::printf("%s: %.3f s for %d passes, %.2f ns/pair (includes %zu-byte data reset per run), images=%zu\n",
                         engine == 0 ? "reference" : "fast", best, bench,
                         best * 1e9 / (double(pairs) * bench), records[0].dataBefore.size(), images().size());
+            std::printf("%s without the harness: %.2f ns/pair, %.1f ns per run (%.1f pairs per run; harness %.1f ns per run)\n",
+                        engine == 0 ? "reference" : "fast", (best - setup) * 1e9 / (double(pairs) * bench),
+                        (best - setup) * 1e9 / (double(records.size()) * bench), double(pairs) / double(records.size()),
+                        setup * 1e9 / (double(records.size()) * bench));
         }
     }
     return fastMismatch == 0 ? 0 : 1;

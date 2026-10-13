@@ -7,6 +7,7 @@
 // BLACK_IDLE_WAIT=0 disables; BLACK_IDLE_WAIT_CYCLES=<n> sets the chunk (default 2000 EE cycles, 6.8 us).
 #include "ps2_runtime.h"
 #include "game_overrides.h"
+#include "runtime/ps2_wait_stats.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,6 +22,30 @@ namespace
     void idleCallbackThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const bool entry = ctx->pc == kIdleCallback; // not a resume in the middle of the function
+        // Timeline mark (diagnostics): the first turn of the wait, i.e. when the game finished its work for the frame.
+        if (entry)
+        {
+            const uint32_t count = g_ps2xMarkCount.load(std::memory_order_relaxed);
+            if (count == 0u || g_ps2xMarks[(count - 1u) & 255u].kind != 'I')
+                ps2xMark('I');
+            // BLACK_FPS_TIMELINE: what the wait is held by, sampled when it has been spinning for 4 ms without a
+            // vertical blank: pending DMA count, queued and sent list pointers, the "frame ready" flag and the
+            // blank counter against its interval.
+            static const bool timeline = std::getenv("BLACK_FPS_TIMELINE") != nullptr;
+            if (timeline)
+            {
+                static uint64_t lastSample = 0;
+                const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                if (now - lastSample > 1500000u)
+                {
+                    lastSample = now;
+                    uint32_t queued, sent;
+                    std::memcpy(&queued, rdram + 0x40E668u, 4);
+                    std::memcpy(&sent, rdram + 0x40E66Cu, 4);
+                    ps2xMark('w', (uint32_t(rdram[0x40E660u]) << 24) | (uint32_t(queued != sent) << 16) | (uint32_t(rdram[0x40E5FFu]) << 8) | (uint32_t(rdram[0x40E671u]) << 4) | rdram[0x40DF74u]);
+                }
+            }
+        }
         g_idleCallback(rdram, ctx, runtime);
         if (entry)
             runtime->eeChargeIdleCycles(g_idleCycles);

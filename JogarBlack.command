@@ -17,12 +17,13 @@ GS_MOLTENVK="${PS2X_GS_MOLTENVK:-$ROOT/recomp/gpu/moltenvk/libMoltenVK.dylib}"
 unset PS2X_PAD_SCRIPT PS2X_GS_THREAD PS2X_GS_METAL PS2X_GS_PARALLEL PS2X_GS_PARALLEL_MODULE PS2X_GS_MOLTENVK PS2X_GS_SDL_GPU
 # VIF1/VU1/GS work on its own thread (the game thread only builds the display lists); BLACK_VIF1_THREAD=0 disables.
 if [[ "${BLACK_VIF1_THREAD:-1}" != "0" ]]; then export PS2X_VIF1_THREAD=1; else unset PS2X_VIF1_THREAD; fi
-# BLACK_GS=native (experimental): the native Metal renderer (hardware rasterizer), drawn straight to the window at
-# BLACK_GS_SCALE times the game's resolution (default 2). See ps2recomp/GS_NATIVE_RENDERER_PLAN.md.
+# Default: the native Metal renderer (hardware rasterizer), drawn straight to the window at BLACK_GS_SCALE times
+# the game's resolution (default 3; 4 holds 60 Hz on an M1 Pro). See ps2recomp/GS_NATIVE_RENDERER_PLAN.md.
+# BLACK_GS=parallel falls back to paraLLEl-GS (the reference the native renderer is checked against).
 NATIVE_MODULE="$ROOT/recomp/gpu/build/libblack-native-gs.so"
 unset PS2X_GS_NATIVE_PRESENT PS2X_GS_NATIVE_SCALE
-if [[ "${BLACK_GS:-auto}" == "native" && -f "$NATIVE_MODULE" ]]; then
-    export PS2X_GS_PARALLEL=1 PS2X_GS_PARALLEL_MODULE="$NATIVE_MODULE" PS2X_GS_MOLTENVK="$GS_MOLTENVK" PS2X_GS_NATIVE_PRESENT=1 PS2X_GS_NATIVE_SCALE="${BLACK_GS_SCALE:-2}"
+if [[ ( "${BLACK_GS:-auto}" == "native" || "${BLACK_GS:-auto}" == "auto" ) && -f "$NATIVE_MODULE" ]]; then
+    export PS2X_GS_PARALLEL=1 PS2X_GS_PARALLEL_MODULE="$NATIVE_MODULE" PS2X_GS_MOLTENVK="$GS_MOLTENVK" PS2X_GS_NATIVE_PRESENT=1 PS2X_GS_NATIVE_SCALE="${BLACK_GS_SCALE:-3}"
 elif [[ "${BLACK_GS:-auto}" != "sdlgpu" && -f "$GS_MODULE" && -f "$GS_MOLTENVK" ]]; then
     export PS2X_GS_PARALLEL=1 PS2X_GS_PARALLEL_MODULE="$GS_MODULE" PS2X_GS_MOLTENVK="$GS_MOLTENVK"
 else
@@ -43,8 +44,18 @@ export PS2X_IOP_RECOMP_CAPTURE="${PS2X_IOP_RECOMP_CAPTURE:-$ROOT/recomp/diagnost
 # IOP scheduling quantum in IOP cycles (runtime default 128): 512 is ~14 us of guest time and cuts the
 # scheduler overhead of an IOP that is idle most of the time.
 export PS2X_IOP_QUANTUM="${PS2X_IOP_QUANTUM:-512}"
-# BLACK_IOP_THREAD=1 (experimental): the IOP (sound, disc, pad) on its own thread instead of inside the game thread.
-if [[ "${BLACK_IOP_THREAD:-}" == "1" ]]; then export PS2X_IOP_THREAD=1; else unset PS2X_IOP_THREAD; fi
+# The IOP (sound, disc, pad) runs on its own thread instead of inside the game thread; sound is still silent in
+# this mode. BLACK_IOP_THREAD=0 puts it back in the game thread (sound, but 60 Hz does not hold).
+# Black's video player asks for pictures by its own clock; the runtime's own pacing only holds its loop back.
+export PS2X_MPEG_PACING="${PS2X_MPEG_PACING:-0}"
+if [[ "${BLACK_IOP_THREAD:-1}" != "0" ]]; then export PS2X_IOP_THREAD=1; else unset PS2X_IOP_THREAD; fi
+# 60 Hz: the game's logic at 60 ticks a second and a new frame every vertical blank (the console runs 30).
+# BLACK_TICK_RATE=30 gives the original rate.
+export BLACK_TICK_RATE="${BLACK_TICK_RATE:-60}"
+# 16:9: the game's own widescreen mode, in a 16:9 window (BLACK_WIDESCREEN=0 for 4:3). PS2X_WINDOW_SIZE is in real
+# pixels (half as many points on a Retina display).
+export BLACK_WIDESCREEN="${BLACK_WIDESCREEN:-1}"
+if [[ "$BLACK_WIDESCREEN" == "1" ]]; then export PS2X_WINDOW_SIZE="${PS2X_WINDOW_SIZE:-2560x1440}"; fi
 # Slow stretches are written down (and which threads were busy) in recomp/diagnostics/hitches.log, at no cost:
 # BLACK_FPS=1 prints every 2 s window to the terminal instead, BLACK_FPS=0 turns it off.
 mkdir -p "$ROOT/recomp/diagnostics"

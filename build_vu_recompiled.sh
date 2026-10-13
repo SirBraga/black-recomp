@@ -39,7 +39,18 @@ done
 python3 "$ROOT/ps2recomp/diagnostics/extract_vu_programs.py" "$ROOT/orig/SLUS_213.76" "$D/vu-programs" >/dev/null
 IMAGES=("$D"/vu-programs/prog[01]-*.bin "$D"/vu-coverage-level00/vu0-*.bin "$D"/vu-trace/images/*/vu0-*.bin "$D"/vu-captured/vu0-*.bin)
 (( ${#IMAGES[@]} )) || { echo "nenhuma imagem VU capturada" >&2; exit 1; }
-"$BIN/ps2x_vu1_recompile" "$OUT" "${ARGS[@]}" "${IMAGES[@]}"
+# Execution profile of every recorded trace (how often each pair ran, from the interpreted engine): the generator
+# lets a block run through the hot landing pairs of branches ("superblocks"), so a hot loop is one block.
+mkdir -p "$D/vu-trace/profile"
+PROFILE=""
+for TRACE in "${TRACES[@]}"; do
+  HIST="$D/vu-trace/profile/$(basename "$TRACE" .bin).txt"
+  [[ -f "$HIST" && "$HIST" -nt "$TRACE" ]] || PS2X_VU_PC_HISTOGRAM="$HIST" "$BIN/ps2x_vu1_trace_replay" "$TRACE" >/dev/null
+  PROFILE="$PROFILE$HIST:"
+done
+# The output is black_vu1_recompiled.inc (helpers, declarations, tables) plus black_vu1_recompiled_part0..7.cpp (the
+# functions, spread over eight files so that they compile in parallel).
+PS2X_VU_RECOMPILE_PROFILE="$PROFILE" PS2X_VU_RECOMPILE_SHARED=0 "$BIN/ps2x_vu1_recompile" "$OUT" "${ARGS[@]}" "${IMAGES[@]}"
 # The core includes the generated file only when it exists (__has_include), so
 # the build system cannot see the dependency the first time: force a recompile.
 touch "$ROOT/tools/PS2Recomp/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp"

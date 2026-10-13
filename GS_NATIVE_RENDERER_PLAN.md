@@ -212,3 +212,105 @@ Thread VIF1/VU1 no ponto pesado (perfil): microprogramas ~68% (um programa, `pro
 | 8 | 13,4% / 9,9% | 0,8% / 0,5% |
 
 Leitura: a saída de um lote quase nunca depende do lote imediatamente anterior, mas depende de algo de 2 ou mais lotes atrás (o lote de preparação do objeto: matrizes, luzes), e quase todo lote deixa registradores e memória diferentes do que deixaria sozinho (ponteiros de buffer alternados, temporários). Não há lotes simplesmente independentes para distribuir: dividir entre núcleos exige execução especulativa (lote N+1 começa do estado anterior ao lote N, com os dados do VIF aplicados) e validação pelo conjunto do que o lote N escreveu contra o que o N+1 lê antes de escrever, que teria de vir da análise estática dos microprogramas. Ganho possível: perto de 1,7× na parte de geometria com dois núcleos. É um projeto de vários dias, com risco, e a VU1 hoje não é o limite a 60 (58–67% de um núcleo); passa a ser para 120 Hz.
+
+## Andamento: padrão do launcher, escala por alvo, vídeo e menu (2026-10-10)
+
+- **Renderizador nativo é o padrão do launcher** (`BLACK_GS=parallel` volta ao paraLLEl-GS, `BLACK_GS=sdlgpu` ao SDL_GPU).
+- **Escala por alvo:** só alvos com `fbw >= 8` (largura de tela) são ampliados. Os buffers de trabalho do jogo
+  (feixes de luz, brilho, fumaça: 160 de largura) ficam em 1×: o jogo os borra amostrando meio texel fora, e num
+  alvo ampliado isso cai no centro de um texel e não borra nada (degraus e linhas pontilhadas nos feixes).
+  `PS2X_GS_NATIVE_SCALE_ALL=1` amplia tudo. Sala em 2×: 14,9 → 11,6 ms por scanout no replay.
+- **Custo de GPU** (`PS2X_GS_NATIVE_STATS=1` agora imprime `gpu=` e passes por scanout), cena pesada:
+  1× 1,3 ms, 2× 2,7 ms, 4× 9,1 ms. O tempo maior do replay em 4× é a leitura da imagem para comparação.
+  No jogo, 4× no ponto do savestate: 3377 quadros em 3377 vblanks.
+- **Menu com vídeo a 30:** `sceMpegGetPicture` do runtime segurava o laço até a hora do quadro. O tocador do Black
+  (`0x271F10`) já escolhe o quadro por tempo / duração; a espera virou opcional (`PS2X_MPEG_PACING=0`, padrão do
+  launcher). Quando o jogo não passa o tempo (flags sem o bit 2, vídeo do menu) o tocador soma um passo fixo por
+  chamada (um quadro por volta): `black_tick_rate.cpp` ajusta o passo para meio quadro por vblank real.
+- **Ticks:** os temporizadores contam `D_003C0E04` × duração; quando uma volta de `0x102BD0` leva mais de um vblank
+  o contador recebe os vblanks extras (`BLACK_TICK_ADAPTIVE=0` desliga).
+- **Quadros com atraso** (savestate, 2×, 56 s): 3375 de 3375 vblanks; voltas >25 ms: 6 → 1.
+- **Revisto no mesmo dia:** manter os buffers estreitos em 1× deixava sombras e fumaça quadriculadas ao lado da cena
+  ampliada. Agora todos os alvos são ampliados e, quando um alvo ampliado é lido com filtro bilinear, o shader faz a
+  média sobre o tamanho do texel do jogo (`texBox`): o borrão de meio texel continua valendo e as bordas ficam na
+  resolução alta. `PS2X_GS_NATIVE_SCALE_NARROW=0` volta ao modo anterior. GPU na cena pesada: 2× 3,5 ms, 4× 11,4 ms.
+
+## Andamento: lotes que leem o próprio alvo (2026-10-11)
+
+- **Causa das diferenças que sobravam em 1×** (faixas e colunas mais claras no brilho, retângulos laranja em volta do
+  fogo): o jogo borra o buffer de brilho (fb=437, 160×112) com 20 sprites num único lote, cada um lendo o que o
+  anterior acabou de desenhar. O renderizador tirava uma cópia do alvo por lote, então nada se acumulava e o brilho
+  saía nítido e com riscos. Agora um lote que lê o alvo em que desenha vai um primitivo por vez, cada um com cópia
+  nova (só das linhas em uso).
+- **Como foi achado:** `gs-replay --vram FRAME ARQUIVO` grava a VRAM inteira do módulo naquele scanout; decodificando o
+  alvo intermediário da referência (paraLLEl-GS) e comparando com `PS2X_GS_NATIVE_SHOW=437,3,0` do nativo, a referência
+  estava borrada e o nativo não.
+- **Resultado contra a referência, 1×, tolerância 24:** heavy 1,35 % → 0,04 %; room 0,32 % → 0,01 %; load 3,8 % → 0,22 %;
+  menu e intro 0 %; titlew 0,08 %. O erro médio de ~4,4 por canal que sobra é o pontilhado de 16 bits da referência
+  (o quadro final do jogo é PSMCT16S; o nativo guarda 8 bits por canal).
+- **Custo:** os passes por scanout foram de ~9 para ~54 na cena pesada; GPU 4,9 ms em 2× e 8,3 ms em 3×.
+- Também ficou: quando a textura é um pedaço de um alvo, CLAMP e REPEAT valem sobre o tamanho da própria textura e não
+  do alvo inteiro (não mudou nenhum dos quadros gravados, mas é o comportamento certo).
+
+## Andamento: quedas nas explosões em 3× (2026-10-11, manhã)
+
+- Relato do usuário: gráficos ótimos, mas algumas explosões derrubam os quadros. O `hitches.log` não registrou nada em
+  jogo: os contadores do jogo não veem a GPU atrasada (o jogo entrega todo quadro no prazo).
+- **Regressão minha corrigida:** dividir "um primitivo por vez" todo lote que lê o próprio alvo fazia o quadro principal
+  (que o jogo relê em lotes de 20 ladrilhos) ser copiado inteiro 40 vezes por scanout. Agora um primitivo só abre grupo
+  novo (e cópia nova) quando os texels que lê incluem pixels que um primitivo anterior do grupo desenhou, julgado na
+  resolução do jogo. O borrão continua sprite a sprite; os ladrilhos voltam a ser um grupo. Passes por scanout na cena
+  pesada: 54 → 32; resultado contra a referência igual (heavy 0,04 %, room 0,01 %).
+- **A GPU agora deixa rastro:** a cada 120 scanouts, se algum passou de 16 ms de GPU, sai uma linha `[black-fps] gpu: ...`
+  (média, pior, passes, draws, primitivos e cópias de alvo por scanout, escala), que o launcher guarda no `hitches.log`.
+- Filtro dos alvos ampliados com 4 amostras em qualquer escala (eram escala² amostras).
+- Variante do shader sem leitura do destino (`fragmentOpaque`) para desenhos sem mistura, máscara ou segundo passe de
+  teste de alfa; `PS2X_GS_NATIVE_NO_OPAQUE=1` desliga. Exata, mas sem ganho mensurável no replay.
+- GPU média na cena pesada gravada (ruidosa de uma rodada para outra): ~4 ms em 2×, ~7–10 ms em 3×, ~11 ms em 4×.
+  Falta um quadro gravado de explosão para saber o que estoura.
+- **Sessão do usuário em 16:9, 3× (log da GPU):** média de 11–15,6 ms por scanout, 40–60 cópias de alvo e 50–70 passes.
+  Causa: no cálculo de quais texels um sprite lê eu usava o x original com o (u, v) do vértice já deslocado de meio
+  pixel (o deslocamento que `sprite()` aplica acima de 1×), então todo ladrilho parecia ler o vizinho e era separado.
+  Corrigido (o mapa linear usa a posição do vértice como foi emitido). Cena pesada gravada, 3×: 32 → 13 passes por
+  scanout, GPU ~7–10 → ~5,4 ms, mesma diferença contra a referência (0,04 %).
+
+## Andamento: apresentação no flip (2026-10-11)
+
+- **Medida nova:** o módulo registra quando cada quadro chega de fato à tela (`presentedTime` do drawable). A linha
+  `[black-fps] gpu: N of M frames reached the screen late` sai quando algum intervalo passa de 25 ms.
+- **Achado:** ~4 quadros atrasados na tela a cada 2 s, iguais em 2× e 3× e até nos menus, com a GPU folgada. A
+  apresentação era feita pelo laço principal, que dorme em 60 Hz por conta própria e só então via que o vblank do
+  jogo tinha passado: duas cadências de 60 Hz sem relação de fase, numa tela de 120 Hz.
+- **Correção (runtime):** com apresentação direta, uma thread `Present` mostra o quadro quando o flip dos registradores
+  de vídeo entra em vigor (o jogo enfileira o flip atrás do desenho do quadro). O laço principal deixa de apresentar
+  enquanto ela está ativa. `PS2X_PRESENT_POLLED=1` volta ao modo antigo.
+- **Resultado** (ponto pesado, 16:9, 3×, ~108 s por rodada, janela em segundo plano): 207 quadros atrasados na tela com
+  o modo antigo, 7 com a apresentação no flip.
+- Próximo passo natural: tirar o vblank do jogo do temporizador por software e amarrá-lo ao refresh da tela
+  (um quadro a cada dois refreshes em 120 Hz), que também é o caminho para os 120 Hz.
+
+## Andamento: tempo de quadro da GPU (2026-10-11, tarde)
+
+- **Medida corrigida:** o tempo de GPU somava buffers de comando que se sobrepõem; agora conta a união dos intervalos.
+  `PS2X_GS_NATIVE_PASS_TIMES=1` (diagnóstico) põe cada passe num buffer próprio, mas a atribuição por passe continua
+  enganosa por causa da mesma sobreposição. `PS2X_GS_NATIVE_TRIVIAL=1` compila um shader de pixel trivial: o piso.
+- **Gravação de referência em 16:9:** `recomp/diagnostics/gs-dump/wide.gsdump` (120 scanouts, ponto pesado, modo wide do
+  jogo, 60 ticks). Atenção: gravar pelo módulo paraLLEl com o jogo a 60 ticks pode juntar vários quadros por scanout.
+- **Onde ia o tempo** (wide, 3×): 7,5 ms por quadro, dos quais 2,5 ms são rasterização (piso) e 5 ms o shader de
+  pixel, que decidia tudo por uniformes a cada pixel.
+- **Shader especializado:** os campos que escolhem caminho (textura, modo de mistura, teste de alfa, filtro, wrap,
+  níveis de mip, máscara...) viram constantes de função do Metal; um pipeline por combinação em uso, compilado em
+  segundo plano na primeira vez (o genérico cobre enquanto isso). `PS2X_GS_NATIVE_GENERIC_SHADER=1` desliga.
+  Mesmas diferenças contra a referência (heavy 0,04 %, room 0,01 %, menu 0 %, titlew 0,08 %).
+
+  | wide.gsdump | antes | agora |
+  |---|---|---|
+  | 2× | 4,1 ms | 2,8 ms |
+  | 3× | 7,5 ms | 4,4 ms |
+  | 4× | 12,3 ms | 7,1 ms |
+
+- **Leitura no lugar:** lote de sprites que relê o próprio alvo pixel a pixel usa o pixel de destino no shader, sem
+  cópia nem quebra de passe (`PS2X_GS_NATIVE_NO_SELF_FETCH=1` desliga). Ganho pequeno.
+- **Runtime:** vblank do jogo amarrado ao refresh da tela pelo display link (um vblank a cada N refreshes quando isso dá
+  60 Hz ± 1 %; `PS2X_VBLANK_DISPLAY_SYNC=0` volta ao temporizador). Com apresentação direta o laço principal não troca
+  mais a superfície OpenGL escondida (`PS2X_GL_SWAP=1` volta).

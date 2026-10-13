@@ -37,7 +37,7 @@ namespace
     {
         static const uint32_t kPositions[] = {0x5a8ad0u, 0x5a8b50u, 0x5a8bb0u, 0x5a8c40u, 0x5a8c70u,
                                               0x5a8cc0u, 0x5a8cd0u, 0x5a8ce0u, 0x5a8f40u};
-        static const uint32_t kYaws[] = {0x5a8da0u, 0x5a8fa0u, 0x5a8fa8u};
+        static const uint32_t kYaws[] = {0x5a8da0u, 0x5a8fa0u, 0x5a8fa8u, 0x5a8facu}; // yaw copies, then pitch
         if (g_poseLeft < 0)
         {
             static unsigned long s_poll = 0;

@@ -108,7 +108,7 @@ namespace direct
     {
         enum Kind { None, Nop, Immediate, Lq, Sq, Lqi, Sqi, Lqd, Sqd, Iaddiu, Isubiu, Iadd, Isub, Iaddi, Iand, Ior,
                     Move, Mr32, Mtir, Mfir, Fmeq, Fmand, Fmor, Branch,
-                    Ilw, Isw, Ilwr, Iswr, Fceq, Fcand, Fcor, Fcget, Div, Sqrt, Rsqrt, Waitq, Mfp, Xtop, Xitop, Xgkick } kind = None;
+                    Ilw, Isw, Ilwr, Iswr, Fceq, Fcand, Fcor, Fcget, Div, Sqrt, Rsqrt, Waitq, Mfp, Xtop, Xitop, Xgkick, Jr, Jalr, Efu, Waitp } kind = None;
         uint32_t dest = 0, ft = 0, fs = 0, it = 0, is = 0, id = 0, op = 0;
         int32_t imm = 0;
     };
@@ -143,6 +143,8 @@ namespace direct
         case 0x1Bu: l.kind = Lower::Fmor; return l;
         case 0x20u: case 0x28u: case 0x29u: case 0x2Cu: case 0x2Du: case 0x2Eu: case 0x2Fu:
             l.kind = Lower::Branch; l.imm = imm11; return l;
+        case 0x24u: l.kind = Lower::Jr; return l;
+        case 0x25u: l.kind = Lower::Jalr; return l;
         case 0x40u:
         {
             const uint32_t funct = instr & 0x3Fu;
@@ -177,6 +179,11 @@ namespace direct
             case 0x68u: l.kind = Lower::Xtop; return l;
             case 0x69u: l.kind = Lower::Xitop; return l;
             case 0x6Cu: l.kind = Lower::Xgkick; return l;
+            // ESADD, ERSADD, ELENG, ERLENG, EATANxy, EATANxz, ESUM, ESQRT, ERSQRT, ERCPR, ESIN, EATAN, EEXP
+            case 0x70u: case 0x71u: case 0x72u: case 0x73u: case 0x74u: case 0x75u: case 0x76u:
+            case 0x78u: case 0x79u: case 0x7Au: case 0x7Cu: case 0x7Du: case 0x7Eu:
+                l.kind = Lower::Efu; return l;
+            case 0x7Bu: l.kind = Lower::Waitp; return l;
             default: return l;
             }
         }
@@ -188,8 +195,7 @@ namespace direct
     inline bool pairIsDirect(const Facts &f, bool mayEnd)
     {
         constexpr uint32_t blocking = VU1Interpreter::PairReserved | VU1Interpreter::PairEndBits | VU1Interpreter::PairEBit |
-                                      VU1Interpreter::PairDBit | VU1Interpreter::PairTBit | VU1Interpreter::PairEfu |
-                                      VU1Interpreter::PairIndirect;
+                                      VU1Interpreter::PairDBit | VU1Interpreter::PairTBit;
         if ((f.bits & blocking) != 0u || mayEnd)
             return false;
         if (decodeUpper(f.upper).kind == Upper::None)
@@ -197,9 +203,29 @@ namespace direct
         return decodeLower(f.lower, (f.bits & VU1Interpreter::PairIBit) != 0u).kind != Lower::None;
     }
 
+    // The same without the end-of-program test: the E-bit pair and the pair after it, which close a block that
+    // returns Ended (the D and T bits stay with stepPair()).
+    inline bool pairIsOrdinary(const Facts &f)
+    {
+        constexpr uint32_t blocking = VU1Interpreter::PairReserved | VU1Interpreter::PairDBit | VU1Interpreter::PairTBit;
+        if ((f.bits & blocking) != 0u)
+            return false;
+        if (decodeUpper(f.upper).kind == Upper::None)
+            return false;
+        return decodeLower(f.lower, (f.bits & VU1Interpreter::PairIBit) != 0u).kind != Lower::None;
+    }
+
+    // JR and JALR: the block ends at their delay slot and goes back to the dispatch loop with the target they read.
+    inline bool pairIsIndirect(const Facts &f)
+    {
+        const Lower::Kind kind = decodeLower(f.lower, (f.bits & VU1Interpreter::PairIBit) != 0u).kind;
+        return kind == Lower::Jr || kind == Lower::Jalr;
+    }
+
     inline bool pairIsBranch(const Facts &f)
     {
-        return decodeLower(f.lower, (f.bits & VU1Interpreter::PairIBit) != 0u).kind == Lower::Branch;
+        const Lower::Kind kind = decodeLower(f.lower, (f.bits & VU1Interpreter::PairIBit) != 0u).kind;
+        return kind == Lower::Branch || kind == Lower::Jr || kind == Lower::Jalr;
     }
 
     // Helpers the generated blocks use (members of struct VuRecompiled).
@@ -211,9 +237,11 @@ namespace direct
     // (flush-to-zero takes care of denormals).
     static inline __attribute__((always_inline)) V D_clamp(V v)
     {
-        const uint32x4_t bits = vreinterpretq_u32_f32(v);
-        const uint32x4_t sign = vandq_u32(bits, vdupq_n_u32(0x80000000u));
-        return vreinterpretq_f32_u32(vorrq_u32(vminq_u32(vbicq_u32(bits, vdupq_n_u32(0x80000000u)), vdupq_n_u32(0x7F7FFFFFu)), sign));
+        // Two steps on the critical path instead of three: as signed integers the positive values above the
+        // largest finite one are cut down and the negative ones are left alone; as unsigned integers it is the
+        // negative ones (sign bit set) that are cut down to the largest finite negative value.
+        const int32x4_t positive = vminq_s32(vreinterpretq_s32_f32(v), vdupq_n_s32(0x7F7FFFFF));
+        return vreinterpretq_f32_u32(vminq_u32(vreinterpretq_u32_s32(positive), vdupq_n_u32(0xFF7FFFFFu)));
     }
     // Operand of the ops that copy bits around: denormals become zero as well.
     static inline __attribute__((always_inline)) V D_norm(V v)
@@ -349,6 +377,14 @@ namespace direct
         vu.m_cycle = cycle;
         return vu.waitPairStall(bits, budgetEnd);
     }
+    // The EFU operations (ESQRT, ERSQRT, ELENG...): rare enough to go through the interpreter's own code, which
+    // reads the operand from the VU state (the block stores it there first) and queues the result for P.
+    static __attribute__((noinline)) void D_efu(VU1Interpreter &vu, uint64_t cycle, uint32_t lower, uint32_t upper, VU_BLOCK_PARAMS)
+    {
+        (void)budgetEnd;
+        vu.m_cycle = cycle;
+        vu.execLower(lower, vuData, dataSize, gs, memory, upper);
+    }
     static inline __attribute__((always_inline)) void D_queueQ(VU1Interpreter &vu, uint64_t cycle, float value, uint32_t latency, uint32_t statusDi)
     {
         vu.m_fdiv.valid = true;
@@ -452,6 +488,8 @@ namespace direct
         uint8_t normal[33]{}; // lanes (bit = lane index) known to hold a finite, non-denormal float
         char text[512];
         uint32_t suppressReg = 0; // VF register the lower instruction must not write (see emitBlock)
+        uint32_t jumpMask = 0;    // microcode address mask, for the target of JR/JALR
+        uint32_t upperWord = 0;   // upper instruction of the pair being emitted
         // Second pass of emitBlock(): registers the block never writes. Their clamped / normalized forms are
         // computed once, before the block's body (and before its loop, if it loops).
         const bool *invariant = nullptr;
@@ -821,10 +859,35 @@ namespace direct
                 (void)pc;
                 return;
             }
+            case Lower::Efu:
+                if (l.fs != 0u)
+                    add("                    vst1q_f32(vu.m_state.vf[%u], %s);\n", l.fs, vf(l.fs).c_str());
+                add("                    D_efu(vu, c + %uu, 0x%08xu, 0x%08xu, VU_BLOCK_ARGS);\n                    nc = vu.m_nextCommitCycle;\n", k, lowerWord, upperWord);
+                return;
+            case Lower::Waitp:
+                return; // the wait itself is the pair's stall test
+            case Lower::Jr:
+            case Lower::Jalr:
+                // The target is read before JALR writes its link register (they may be the same one).
+                add("                    jump = (static_cast<uint32_t>(static_cast<uint16_t>(%s)) * 8u) & 0x%04xu;\n                    taken = true;\n",
+                    branchVi(l.is).c_str(), jumpMask);
+                if (l.kind == Lower::Jalr)
+                    setVi(l.it, "static_cast<int32_t>(" + std::to_string((pc + 16u) / 8u) + ")");
+                return;
             default:
                 return;
             }
         }
+    };
+
+    // With `shared`, the registers are locals of the whole function instead of the block (VU_REGS, declared by the
+    // caller): the caller loads them (VU_LOAD) where the dispatch switch enters a block, and they are stored
+    // (VU_STORE) wherever control goes back to the dispatch loop or out of the function; from one block to the
+    // next (`chain` jumps straight to its label) they stay in machine registers, so a loop made of several blocks
+    // no longer passes its values through memory on every turn. `shared` collects which registers the function's blocks use and write.
+    struct SharedRegisters
+    {
+        bool vfUsed[33] = {}, vfWritten[33] = {}, viUsed[16] = {}, viWritten[16] = {};
     };
 
     // Emits the block made of facts[first .. first+count). A branch inside it comes with its delay slot;
@@ -834,14 +897,16 @@ namespace direct
     // block or back to the dispatch loop) and `again` the condition under which the block may loop.
     inline std::string emitBlock(const std::vector<Facts> &facts, uint32_t first, uint32_t count, uint32_t pcMask,
                                  const std::function<std::string(uint32_t)> &chain, const std::string &again,
-                                 const bool *invariantVf = nullptr)
+                                 const bool *invariantVf = nullptr, bool ends = false, SharedRegisters *shared = nullptr)
     {
         Emitter e;
         e.invariant = invariantVf;
+        e.jumpMask = pcMask;
         // Pairs that may have to wait: the cycle base can move there, and they look at the ready times.
         const auto waitCapable = [&](uint32_t k)
         {
-            return k < 4u || facts[first + k].hazardReads != 0u || (facts[first + k].bits & VU1Interpreter::PairStall) != 0u;
+            return k < 4u || facts[first + k].hazardReads != 0u || (facts[first + k].bits & VU1Interpreter::PairStall) != 0u ||
+                   pairIsIndirect(facts[first + k - 1u]); // its delay slot takes the full hazard check
         };
         // Ready times (m_vfReady / m_viReady) of the registers written so far. Nothing inside the block
         // reads them except a pair that may wait, so a write is only stored at once when such a pair lies
@@ -868,6 +933,7 @@ namespace direct
         };
         uint32_t branchTarget = 0u;
         bool afterBranch = false; // the pair being emitted is the delay slot of the branch to branchTarget
+        bool indirect = false;    // ...of a JR/JALR: the target is in `jump`
         bool loops = false;
         int backupReg = -1; // VI register hidden from a branch in the next pair, its old value is in `old`
         const auto backupText = [](int reg) -> std::string
@@ -893,7 +959,9 @@ namespace direct
             exitText += leave;
             if (k != 0u)
                 exitText += backupText(backupReg);
-            if (afterBranch)
+            if (afterBranch && indirect)
+                exitText += "vu.m_state.branchPending = taken; vu.m_state.branchTarget = jump; vu.m_state.branchDelay = 0; ";
+            else if (afterBranch)
             {
                 std::snprintf(leave, sizeof(leave), "vu.m_state.branchPending = taken; vu.m_state.branchTarget = 0x%04xu; vu.m_state.branchDelay = 0; ", branchTarget);
                 exitText += leave;
@@ -906,7 +974,7 @@ namespace direct
             };
             // After an indirect jump (or at a program entry) the pairs before this one are not the ones the
             // static hazard masks assume: up to four pairs then take the full register check, as in stepPair().
-            if (k < 4u)
+            if (k < 4u || (afterBranch && indirect))
             {
                 e.add("                    if (__builtin_expect(hu != 0u, 0))\n                    {\n");
                 e.add("                        const bool ok = D_hazards(vu, c + %uu, 0x%04xu, budgetEnd);\n", k, pc);
@@ -916,7 +984,7 @@ namespace direct
             if (f.hazardReads != 0u)
             {
                 // Same test as stepPair(): the registers this pair reads must have left their writer's pipeline.
-                e.add("                    %s{\n                        uint64_t ready = c + %uu;\n", k < 4u ? "else " : "", k);
+                e.add("                    %s{\n                        uint64_t ready = c + %uu;\n", (k < 4u || (afterBranch && indirect)) ? "else " : "", k);
                 for (uint32_t slot = 0; slot < 4u; ++slot)
                 {
                     const uint32_t access = static_cast<uint32_t>(f.hazardReads >> (9u * slot)) & 0x1FFu;
@@ -959,18 +1027,25 @@ namespace direct
             const int previousBackup = backupReg;
             // When both instructions write the same VF register the upper one wins, whole register.
             e.suppressReg = pending.write && pending.reg != kAcc ? pending.reg : 0u;
+            e.upperWord = f.upper;
             e.lower(l, f.lower, pc, k, [&](uint32_t reg) -> std::string
             {
                 if (reg == 0u)
                     return "0";
                 if (previousBackup == static_cast<int>(reg))
                     return "old";
+                // First pair of the block: whether the pair before it hid this register is only known at run time.
+                if (k == 0u)
+                    return "(vu.m_viBranchBackupValid && vu.m_viBranchBackupReg == " + std::to_string(reg) + "u ? vu.m_viBranchBackupValue : " + e.vi(reg) + ")";
                 return e.vi(reg);
             });
-            const bool delaySlot = afterBranch;
-            afterBranch = l.kind == Lower::Branch;
-            if (afterBranch)
+            const bool delaySlot = afterBranch, delayOfIndirect = afterBranch && indirect;
+            afterBranch = l.kind == Lower::Branch || l.kind == Lower::Jr || l.kind == Lower::Jalr;
+            indirect = l.kind == Lower::Jr || l.kind == Lower::Jalr;
+            if (l.kind == Lower::Branch)
                 branchTarget = (pc + 8u + static_cast<uint32_t>(l.imm * 8)) & pcMask;
+            if (indirect)
+                e.add("                    hu = 4u;\n"); // the delay slot, the target and the two pairs after it: full hazard check
             e.suppressReg = 0u;
             if (pending.write)
                 e.setVf(pending.reg, pending.dest, "u", pending.normalLanes);
@@ -992,6 +1067,13 @@ namespace direct
             {
                 // The branch of the pair before this one is resolved here.
                 e.add("                if (taken)\n                {\n");
+                if (delayOfIndirect)
+                {
+                    e.body += "                    @@STORES@@vu.m_hazardUnknown = static_cast<uint8_t>(hu); " + backupText(backupReg) + pendingReady(k + 1u) + "\n";
+                    e.add("                    vu.m_cycle = c + %uu; vu.m_executedPairs += %uu; vu.m_directPairs += %uu; vu.m_state.pc = jump;\n                    continue;\n                }\n",
+                          k + 1u, k + 1u, k + 1u);
+                    continue;
+                }
                 if (branchTarget == first * 8u)
                 {
                     loops = true;
@@ -1013,7 +1095,7 @@ namespace direct
             bool invariantSet[33];
             for (uint32_t reg = 0; reg <= kAcc; ++reg)
                 invariantSet[reg] = !e.vfWritten[reg];
-            return emitBlock(facts, first, count, pcMask, chain, again, invariantSet);
+            return emitBlock(facts, first, count, pcMask, chain, again, invariantSet, ends, shared);
         }
 
         std::string stores;
@@ -1036,14 +1118,28 @@ namespace direct
                 stores += text;
             }
 
+        if (shared)
+        {
+            for (uint32_t reg = 1; reg <= kAcc; ++reg)
+            {
+                shared->vfUsed[reg] = shared->vfUsed[reg] || e.vfRead[reg] || e.vfWritten[reg];
+                shared->vfWritten[reg] = shared->vfWritten[reg] || e.vfWritten[reg];
+            }
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+            {
+                shared->viUsed[reg] = shared->viUsed[reg] || e.viRead[reg] || e.viWritten[reg];
+                shared->viWritten[reg] = shared->viWritten[reg] || e.viWritten[reg];
+            }
+            stores = "VU_STORE "; // leaving for code that reads the VU state
+        }
         std::string out;
         char mask[80];
         std::snprintf(mask, sizeof(mask), "                constexpr uint32_t DM = 0x%04xu; (void)DM;\n", pcMask & ~0xFu); // data memory, as large as code memory
         out += mask;
         out += "                uint64_t c = vu.m_cycle;\n                uint64_t nc = vu.m_nextCommitCycle;\n"
-               "                bool taken = false; int32_t old = 0; (void)taken; (void)old;\n"
+               "                bool taken = false; int32_t old = 0; uint32_t jump = 0; (void)taken; (void)old; (void)jump;\n"
                "                uint32_t hu = vu.m_hazardUnknown;\n";
-        for (uint32_t reg = 1; reg <= kAcc; ++reg)
+        for (uint32_t reg = 1; reg <= kAcc && !shared; ++reg)
             if (e.vfRead[reg] || e.vfWritten[reg])
             {
                 if (reg == kAcc)
@@ -1054,7 +1150,7 @@ namespace direct
                     out += text;
                 }
             }
-        for (uint32_t reg = 1; reg < 16u; ++reg)
+        for (uint32_t reg = 1; reg < 16u && !shared; ++reg)
             if (e.viRead[reg] || e.viWritten[reg])
             {
                 std::snprintf(text, sizeof(text), "                int32_t i%u = vu.m_state.vi[%u];\n", reg, reg);
@@ -1074,7 +1170,8 @@ namespace direct
         for (size_t at = body.find("@@STORES@@"); at != std::string::npos; at = body.find("@@STORES@@", at))
             body.replace(at, 10u, stores);
         out += body;
-        out += "                " + stores + "\n";
+        if (!shared)
+            out += "                " + stores + "\n"; // shared registers stay in their locals for the next block
         const uint32_t nextPc = ((first + count) * 8u) & pcMask;
         std::snprintf(text, sizeof(text), "                vu.m_cycle = c + %uu;\n                vu.m_executedPairs += %uu;\n                vu.m_directPairs += %uu;\n"
                                           "                vu.m_hazardUnknown = static_cast<uint8_t>(hu);\n", count, count, count);
@@ -1082,7 +1179,8 @@ namespace direct
         out += "                " + backupText(backupReg) + pendingReady(count) + "\n";
         std::snprintf(text, sizeof(text), "                vu.m_state.pc = 0x%04xu;\n                ", nextPc);
         out += text;
-        out += chain(nextPc) + "\n";
+        // A block that ends at the E bit's delay slot ends the program: the caller flushes the pipelines.
+        out += (ends ? std::string(shared ? "VU_STORE return R::Ended;" : "return R::Ended;") : chain(nextPc)) + "\n";
         return out;
     }
 }
